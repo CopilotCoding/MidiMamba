@@ -216,6 +216,15 @@ def generate(
             while gen_tokens < max_tokens:
                 next_logits = logits[0, -1].clone()
 
+                # Always mask conditioning tokens — model should never generate these
+                next_logits[:tok.COND_END] = float("-inf")
+
+                # Force first token to be BAR
+                if gen_tokens == 0:
+                    music_mask = torch.full_like(next_logits, float("-inf"))
+                    music_mask[tok.BAR] = 0.0
+                    next_logits = next_logits + music_mask
+
                 # EOS suppression
                 if len(tokens) < min_tokens + len(cond_prefix):
                     next_logits[tok.EOS] = float("-inf")
