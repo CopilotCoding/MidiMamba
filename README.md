@@ -66,8 +66,19 @@ different filenames but identical byte content — the same transcription saved 
 names. Training on raw GiantMIDI means certain pieces get over-represented at 3-10x without
 any visible indication.
 
-Use SHA256-based deduplication on your raw files, keeping the oldest copy per hash.
-After deduplication, GiantMIDI typically loses 15-25% of its files.
+Use the included `midideduper.py` to SHA256-deduplicate your raw files, keeping the oldest
+copy per hash:
+
+```
+# Dry run first — see what would be deleted
+python midideduper.py --path "path/to/midi" --dry-run
+
+# Actually delete duplicates
+python midideduper.py --path "path/to/midi"
+```
+
+After deduplication, GiantMIDI typically loses 15-25% of its files. A log of all kept and
+deleted files is written to `dedupe_log.txt`.
 
 On Windows, `rglob("*.mid")` and `rglob("*.MID")` both match the same files on
 case-insensitive NTFS. The scanner and tokenizer both deduplicate by lowercase path.
