@@ -454,6 +454,7 @@ def main():
                 expand=args.expand,
                 d_state=args.d_state,
                 max_seq=args.seq_len,
+                grad_checkpoint=args.grad_checkpoint,
             )
             try:
                 sweep_model = MidiMamba(sweep_cfg).to(device)
