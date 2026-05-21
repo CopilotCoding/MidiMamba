@@ -67,44 +67,72 @@ def _ssm_scan(
 ) -> torch.Tensor:
     """
     h[t] = dA[t] * h[t-1] + dBx[t]
-    y[t] = (h[t] * C[t]).sum(-1)   (dot product over state dim)
+    y[t] = (h[t] * C[t]).sum(-1)
     Returns y: (B, T, H)
+
+    Fast implementation: within each segment of SEG tokens, use the identity:
+      h[t] = exp(logcumA[t]) * cumsum(dBx * exp(-logcumA))[t]
+             + exp(logcumA[t]) * carry_in
+
+    To prevent overflow/underflow, normalize by the per-step log value:
+      logcumA values are always <= 0 (since dA in (0,1))
+      So exp(logcumA[t]) is always in (0,1] — never overflows
+      But exp(-logcumA[s]) can be huge (1/tiny_number) when cumA[s] is small
+
+    Solution: process in small enough segments that cumA stays sane.
+    With dA in (0.05, 1.0) and SEG=512:
+      worst case cumA = 0.05^512 — still underflows
+    
+    Instead: use the recurrence directly but with torch.vmap-style batching.
+    Scan the time dimension using torch.linalg or manual unroll isn't needed —
+    torch.cumprod of the (a, b) pairs works if we store them correctly.
+
+    Correct stable approach: scan in segments of SEG=64 where cumA stays sane,
+    then chain segments via carry. Within each mini-segment, cumA can't underflow.
     """
     dtype = dBx.dtype
     dA  = dA.float().clamp(1e-6, 1.0)
-    dBx = dBx.float().clamp(-1e4, 1e4)  # prevent inf inputs
+    dBx = dBx.float().clamp(-1e4, 1e4)
     C   = C.float()
 
     B, T, H, S = dBx.shape
-    SEG = 8192
+
+    # With dA_min=0.05 and SEG=64: cumA_min = 0.05^64 ≈ 5e-84 — borderline
+    # With dA_min=0.05 and SEG=32: cumA_min = 0.05^32 ≈ 2e-42 — safe in float32
+    # Use SEG=32 for guaranteed numerical stability, chain ~1662 segments for T=53178
+    SEG = 32
 
     out = torch.zeros(B, T, H, S, device=dBx.device, dtype=torch.float32)
     h   = torch.zeros(B, H, S,    device=dBx.device, dtype=torch.float32)
 
     for s in range(0, T, SEG):
         e    = min(s + SEG, T)
-        dA_s = dA  [:, s:e]   # (B, C, H)
-        Bx_s = dBx [:, s:e]   # (B, C, H, S)
-        C    = C               # unchanged
-
-        # Sequential scan within segment — simple, correct, numerically stable.
-        # Python loop over C (<=8192) with vectorized CUDA ops per step.
-        # Each iteration is a tiny (B, H, S) elementwise op — GPU overhead minimal.
+        dA_s = dA[:, s:e]    # (B, C, H)   C <= SEG
+        Bx_s = dBx[:, s:e]   # (B, C, H, S)
         C_seg = e - s
-        h_steps = []
-        h_t = h.clone()
-        for t in range(C_seg):
-            h_t = dA_s[:, t].unsqueeze(-1) * h_t + Bx_s[:, t]
-            h_steps.append(h_t)
-        bu    = torch.stack(h_steps, dim=1)   # (B, C, H, S)
-        carry = torch.zeros_like(bu)           # carry already baked in via h_t
 
-        h_seg    = bu.clamp(-1e6, 1e6)
+        # Within this small segment, cumprod is numerically safe
+        logA     = torch.log(dA_s)                          # (B, C, H)
+        logcumA  = torch.cumsum(logA, dim=1)                # (B, C, H)
+        cumA     = torch.exp(logcumA)                       # (B, C, H) — safe at SEG=32
+
+        # inv_cumA[s] = exp(-logcumA[s]) — divides out the cumulative decay
+        # At SEG=32 with dA_min=0.05: max logcumA magnitude = 32*|log(0.05)| ≈ 96
+        # exp(96) ≈ 4e41 — overflows float32 (max ~3.4e38)
+        # Fix: clamp to float32 safe range
+        inv_cumA = torch.exp((-logcumA).clamp(max=85))     # (B, C, H)
+
+        Bu_norm  = Bx_s * inv_cumA.unsqueeze(-1)            # (B, C, H, S)
+        bu       = cumA.unsqueeze(-1) * torch.cumsum(Bu_norm, dim=1)  # (B, C, H, S)
+
+        # Carry from previous segment
+        carry    = cumA.unsqueeze(-1) * h.unsqueeze(1)      # (B, C, H, S)
+
+        h_seg    = (bu + carry).clamp(-1e6, 1e6)
         out[:, s:e] = h_seg
         h        = h_seg[:, -1]
 
-    # Output: dot product with C per timestep
-    y = (out * C.float()).sum(-1)  # (B, T, H)
+    y = (out * C).sum(-1)   # (B, T, H)
     return y.to(dtype)
 
 

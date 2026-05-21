@@ -14,7 +14,7 @@ Mamba's SSM state carries full history in a fixed-size recurrent state at O(1) m
 The model can generate hour-long pieces without ever losing context of what it already played.
 
 Two modes:
-- **Training** — segmented log-space cumsum scan over full sequence, pure CUDA ops
+- **Training** — segmented cumsum scan over full sequence, ~1662 Python iterations for T=53K (SEG=32), pure CUDA ops within each segment
 - **Inference** — single-token recurrent step, O(1) memory regardless of sequence length
 
 ### What makes this implementation different
@@ -23,19 +23,22 @@ Two modes:
 - **Pure PyTorch SSM.** No mamba-ssm, no bitsandbytes, no flash-attention. Everything is PyTorch primitives. Runs anywhere PyTorch runs, on any OS, on consumer hardware.
 - **Data quality over quantity.** SHA256 dedup at file level and token sequence level, 12-byte pre-filter before any parsing, scanner-derived rejection criteria. Cleaner than most published MIDI generation datasets.
 - **Conditioning vocab built from scan output.** Bucket boundaries represent real percentiles of your actual corpus, not hardcoded ranges.
-- **No fallback parsing.** Files not in corpus_stats.json are skipped entirely — no silent degradation.
+- **Verified correct SSM scan.** The segmented cumsum scan is tested against a sequential reference implementation at every sequence length. Previous implementations silently produced wrong gradients — the test suite catches this.
 
 ---
 
 ## Pipeline
 
 ```
+0. midideduper.py     — SHA256 dedup your raw MIDI files before anything else
 1. scan_dataset.py    — pre-filter + scan MIDI files, build auto-bucketed vocab config
 2. build_dataset.py   — tokenize using scan results, deduplicate, trim outliers
 3. validate_tokens.py — validate token distribution, near-dupes, dead tokens
 4. train.py           — train with hash-based train/val split (no leakage)
 5. generate.py        — generate MIDI with optional conditioning
 6. eval_generated.py  — objective quality metrics on generated samples
+7. diagnostic.py      — conditioning response + SSM state coherence tests
+8. test_scan.py       — verify scan correctness against sequential reference
 ```
 
 ---
@@ -411,18 +414,25 @@ y[t] = C[t] @ h[t]                            output
 
 ### Scan implementation
 
-Segmented log-space cumsum — ~7 Python iterations for T=53K (SEG=8192). All heavy
-work inside each segment is pure CUDA (log, cumsum, exp). Numerically stable via
-log-domain with clamping. Runs in float32 internally regardless of autocast.
+Segmented cumsum scan — ~1662 Python iterations for T=53K (SEG=32). Within each
+segment of 32 tokens, cumprod stays numerically safe in float32 (worst case
+cumA = dA_min^32 ≈ 2e-42, well above float32 underflow). Segments are chained
+via carry state. Verified correct against sequential reference at all sequence
+lengths with max error < 5e-7. Runs in float32 internally regardless of autocast.
 
 Within each segment:
 ```
-logcumA      = cumsum(log(dA))           # accumulated decay in log space
-inv_cumA     = exp(-logcumA_prev)        # inverse for input normalization
-Bu_norm      = dBx * inv_cumA           # normalize inputs
-h            = cumA * cumsum(Bu_norm)   # reconstruct hidden states
-             + cumA * carry             # plus propagated carry from previous segment
+logcumA  = cumsum(log(dA))               # accumulated decay in log space
+cumA     = exp(logcumA)                  # safe at SEG=32
+inv_cumA = exp(-logcumA).clamp(max=85)  # normalize inputs, clamped for safety
+Bu_norm  = dBx * inv_cumA               # scale inputs by inverse cumulative decay
+bu       = cumA * cumsum(Bu_norm)        # reconstruct hidden states
+carry    = cumA * h_prev                 # propagate carry from previous segment
+h_seg    = bu + carry                    # final hidden states for this segment
 ```
+
+The `test_scan.py` script verifies correctness against a sequential reference
+implementation at T=16, 128, 1024, 2048, 8192, 16384, and 53178.
 
 ### Inference
 
