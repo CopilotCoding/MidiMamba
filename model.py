@@ -87,25 +87,19 @@ def _ssm_scan(
         Bx_s = dBx [:, s:e]   # (B, C, H, S)
         C    = C               # unchanged
 
-        # logcumA[t] = log(dA[s]) + ... + log(dA[s+t])
-        logcumA      = torch.cumsum(torch.log(dA_s), dim=1)  # (B, C, H)
-        cumA         = torch.exp(logcumA.clamp(-80, 0))       # (B, C, H) in (0,1]
+        # Sequential scan within segment — simple, correct, numerically stable.
+        # Python loop over C (<=8192) with vectorized CUDA ops per step.
+        # Each iteration is a tiny (B, H, S) elementwise op — GPU overhead minimal.
+        C_seg = e - s
+        h_steps = []
+        h_t = h.clone()
+        for t in range(C_seg):
+            h_t = dA_s[:, t].unsqueeze(-1) * h_t + Bx_s[:, t]
+            h_steps.append(h_t)
+        bu    = torch.stack(h_steps, dim=1)   # (B, C, H, S)
+        carry = torch.zeros_like(bu)           # carry already baked in via h_t
 
-        # logcumA_prev: shift by one, first entry = 0 (no decay yet)
-        logcumA_prev = torch.cat([
-            torch.zeros(B, 1, H, device=dBx.device),
-            logcumA[:, :-1]
-        ], dim=1)
-        inv_cumA     = torch.exp((-logcumA_prev).clamp(-80, 0))  # (B, C, H)
-
-        # Weighted cumsum of inputs
-        Bx_norm  = Bx_s * inv_cumA.unsqueeze(-1)                  # (B, C, H, S)
-        bu       = cumA.unsqueeze(-1) * torch.cumsum(Bx_norm, dim=1)
-
-        # Carry: propagate h through segment
-        carry    = cumA.unsqueeze(-1) * h.unsqueeze(1)            # (B, C, H, S)
-
-        h_seg    = (bu + carry).clamp(-1e6, 1e6)                  # prevent explosion
+        h_seg    = bu.clamp(-1e6, 1e6)
         out[:, s:e] = h_seg
         h        = h_seg[:, -1]
 
