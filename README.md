@@ -123,6 +123,21 @@ python validate_tokens.py --data tokens_out --stats stats_out
 
 Watch for: low entropy warnings, skewed conditioning dimensions, dead tokens > 30%, near-duplicate rate > 20%.
 
+Example output: 
+Sequence stats 
+Files: 163,068 
+Min: 131 
+Avg: 15,499 
+P50: 13,573 
+P90: 31,029 
+P99: 53,173 
+Max: 150,889 
+Token stats 
+Total tokens: 2,527,427,619 
+Unique tokens: 441 
+Entropy: 5.68 bits 
+Duplicates: 0
+
 ---
 
 ## Step 4 — Train
@@ -132,7 +147,7 @@ Watch for: low entropy warnings, skewed conditioning dimensions, dead tokens > 3
 Run the sweep before committing to a config. Tests increasing model sizes with a real forward+backward pass and reports peak VRAM.
 
 ```
-python train.py tokens_out --stats stats_out --seq_len 16384 --batch_size 1 --sweep_models
+python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --sweep_models --grad_checkpoint --compile
 ```
 
 Prints a table and outputs a ready-to-paste training command at the bottom.
@@ -146,7 +161,7 @@ python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_l
 ### Train
 
 ```
-python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_len 16384 --batch_size 1 --grad_accum 8 --epochs 10 --out run
+python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --grad_accum 8 --d_model 128 --n_layers 8 --epochs 1 --out run
 ```
 
 Auto-resumes from `run/checkpoints/latest` if it exists. Best val loss checkpoint always saved to `run/checkpoints/best`.
