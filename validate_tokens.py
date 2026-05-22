@@ -2,28 +2,14 @@
 validate_tokens.py
 
 Phase 3 (optional but recommended): Validate tokenized dataset quality.
-
-Computes:
-  - Token frequency table and top 100 tokens
-  - Shannon entropy of token distribution
-  - Sequence length histogram with P50/P90/P99/max
-  - Conditioning token usage per dimension
-  - Duplicate sequence detection
-  - Warning flags for pathological distributions
-
-Run after build_dataset.py to confirm training data is healthy before
-spending GPU time on a poisoned dataset.
-
-Usage:
-    python validate_tokens.py --data tokens_out --stats stats_out
 """
 
 import argparse
 import json
 import math
+import hashlib
 from collections import Counter
 from pathlib import Path
-import hashlib
 
 import numpy as np
 from rich.console import Console
@@ -64,7 +50,7 @@ def main():
     duplicates = 0
 
     # ------------------------------------------------------------
-    # SINGLE PASS CORE LOOP (FIXED BOTTLENECK)
+    # PASS 1
     # ------------------------------------------------------------
     with Progress(
         SpinnerColumn(),
@@ -76,17 +62,15 @@ def main():
         task = progress.add_task("", total=len(files))
 
         for i, fpath in enumerate(files):
-            arr = np.load(fpath)
+            arr = np.load(fpath, mmap_mode="r")
 
-            # lengths (no Python list growth)
             lengths[i] = arr.shape[0]
 
-            # vectorized token counting (NO .tolist())
-            unique, counts = np.unique(arr, return_counts=True)
-            token_counter.update(dict(zip(unique.tolist(), counts.tolist())))
+            # FAST PATH: avoid Python list conversion explosion
+            uniq, cnt = np.unique(arr, return_counts=True)
+            token_counter.update(dict(zip(uniq.astype(np.int64), cnt.astype(np.int64))))
 
-            # duplicate detection unchanged semantics
-            h = hashlib.sha256(arr.tobytes()).hexdigest()
+            h = hashlib.blake2b(arr.tobytes()).hexdigest()
             if h in seen_hashes:
                 duplicates += 1
             else:
@@ -98,15 +82,15 @@ def main():
     n_files = len(files)
 
     # ------------------------------------------------------------
-    # LENGTH STATS (UNCHANGED OUTPUT)
+    # LENGTH STATS
     # ------------------------------------------------------------
-    lengths_sorted = np.sort(lengths)
+    ls = np.sort(lengths)
 
-    p50 = int(lengths_sorted[int(n_files * 0.50)])
-    p90 = int(lengths_sorted[int(n_files * 0.90)])
-    p99 = int(lengths_sorted[int(n_files * 0.99)])
-    pmax = int(lengths_sorted[-1])
-    pmin = int(lengths_sorted[0])
+    p50 = int(ls[int(n_files * 0.50)])
+    p90 = int(ls[int(n_files * 0.90)])
+    p99 = int(ls[int(n_files * 0.99)])
+    pmax = int(ls[-1])
+    pmin = int(ls[0])
     pavg = int(lengths.mean())
 
     console.print("[bold]Sequence lengths:[/bold]")
@@ -119,12 +103,12 @@ def main():
     console.print(f"  Max:    {pmax:,}")
 
     if pmax > p90 * 10:
-        console.print(f"  [red]WARNING: Max ({pmax:,}) is >10x P90 ({p90:,})[/red]")
+        console.print(f"  [red]WARNING: Max outliers[/red]")
     if pavg < p50 * 0.5:
-        console.print(f"  [red]WARNING: Avg ({pavg:,}) << P50 ({p50:,})[/red]")
+        console.print(f"  [red]WARNING: Skewed lengths[/red]")
 
     # ------------------------------------------------------------
-    # TOKEN DISTRIBUTION
+    # TOKEN STATS
     # ------------------------------------------------------------
     console.print(f"\n[bold]Token distribution:[/bold]")
     console.print(f"  Total tokens:  {total_tokens:,}")
@@ -155,9 +139,6 @@ def main():
         if tid == tok.BOS: return "BOS"
         if tid == tok.EOS: return "EOS"
         if tid == tok.BAR: return "BAR"
-        if tid == tok.SECTION_EARLY: return "SECTION_EARLY"
-        if tid == tok.SECTION_MID: return "SECTION_MID"
-        if tid == tok.SECTION_LATE: return "SECTION_LATE"
 
         if tok.POS_OFFSET <= tid < tok.POS_OFFSET + 16:
             return f"POS_{tid - tok.POS_OFFSET}"
@@ -175,33 +156,29 @@ def main():
         if tid < tok.COND_END:
             for field, cfg in bucket_config.items():
                 o = cfg["token_offset"]
-                n = cfg["n_buckets"]
-                if o <= tid < o + n:
+                if o <= tid < o + cfg["n_buckets"]:
                     return f"COND_{field}_b{tid-o}"
 
         return f"UNK_{tid}"
 
-    table = Table(show_header=True, header_style="bold")
+    table = Table(show_header=True)
     table.add_column("Rank")
     table.add_column("Token ID")
     table.add_column("Name")
     table.add_column("Count")
     table.add_column("%")
 
-    top_tokens = token_counter.most_common(args.top_n)
-
-    for i, (tid, c) in enumerate(top_tokens, 1):
-        pct = 100 * c / total_tokens
-        table.add_row(str(i), str(tid), token_name(tid), str(c), f"{pct:.2f}")
+    for i, (tid, c) in enumerate(token_counter.most_common(args.top_n), 1):
+        table.add_row(str(i), str(tid), token_name(tid), str(c), f"{100*c/total_tokens:.2f}")
 
     console.print(table)
 
     # ------------------------------------------------------------
-    # CONDITIONING USAGE (UNCHANGED LOGIC)
+    # CONDITIONING
     # ------------------------------------------------------------
-    console.print(f"\n[bold]Conditioning token usage per dimension:[/bold]")
+    console.print("\n[bold]Conditioning token usage per dimension:[/bold]")
 
-    cond_table = Table(show_header=True, header_style="bold")
+    cond_table = Table(show_header=True)
     cond_table.add_column("Field")
     cond_table.add_column("Buckets")
     cond_table.add_column("Used")
@@ -213,47 +190,37 @@ def main():
         offset = cfg["token_offset"]
         n_buckets = cfg["n_buckets"]
 
-        bucket_counts = np.array([
-            token_counter.get(offset + i, 0) for i in range(n_buckets)
-        ])
+        counts = np.array([token_counter.get(offset + i, 0) for i in range(n_buckets)], dtype=np.int64)
 
-        total_field = bucket_counts.sum()
-        used = int(np.count_nonzero(bucket_counts))
+        total = counts.sum()
+        used = int(np.count_nonzero(counts))
         coverage = 100 * used / n_buckets
+        top_pct = 100 * counts.max() / max(total, 1)
 
-        top_pct_field = 100 * bucket_counts.max() / max(total_field, 1)
-
-        if top_pct_field > 80:
+        if top_pct > 80:
             status = "[red]SKEWED[/red]"
-        elif top_pct_field > 60:
+        elif top_pct > 60:
             status = "[yellow]UNEVEN[/yellow]"
         elif coverage < 50:
             status = "[yellow]SPARSE[/yellow]"
         else:
             status = "[green]OK[/green]"
 
-        cond_table.add_row(
-            field,
-            str(n_buckets),
-            str(used),
-            f"{coverage:.0f}%",
-            f"{top_pct_field:.1f}%",
-            status
-        )
+        cond_table.add_row(field, str(n_buckets), str(used), f"{coverage:.0f}%", f"{top_pct:.1f}%", status)
 
     console.print(cond_table)
 
     # ------------------------------------------------------------
     # DEAD TOKENS
     # ------------------------------------------------------------
-    used_token_ids = set(token_counter.keys())
-    dead_pct = 100 * (tok.VOCAB_SIZE - len(used_token_ids)) / tok.VOCAB_SIZE
+    used = set(token_counter.keys())
+    dead_pct = 100 * (tok.VOCAB_SIZE - len(used)) / tok.VOCAB_SIZE
 
     console.print("\n[bold]Dead token detection:[/bold]")
     console.print(f"  Dead tokens: {dead_pct:.1f}%")
 
     # ------------------------------------------------------------
-    # NEAR DUPLICATE (UNCHANGED LOGIC, SINGLE PASS)
+    # PASS 2 (FINGERPRINT - OPTIMIZED MEMORY ONLY)
     # ------------------------------------------------------------
     console.print("\n[bold]Near-duplicate detection:[/bold]")
 
@@ -268,36 +235,27 @@ def main():
 
         task = progress.add_task("", total=len(files))
 
-        for i, fpath in enumerate(files):
-            arr = np.load(fpath)
+        for fpath in files:
+            arr = np.load(fpath, mmap_mode="r")
 
-            slots = frozenset(arr[(arr >= tok.TRACK_OFFSET) &
-                                  (arr < tok.TRACK_OFFSET + 9)] - tok.TRACK_OFFSET)
+            track = arr[(arr >= tok.TRACK_OFFSET) & (arr < tok.TRACK_OFFSET + 9)] - tok.TRACK_OFFSET
+            slots = frozenset(track.tolist())
 
-            pitch = arr[(arr >= tok.PITCH_OFFSET) &
-                        (arr < tok.PITCH_OFFSET + 88)]
+            pitch = arr[(arr >= tok.PITCH_OFFSET) & (arr < tok.PITCH_OFFSET + 88)]
+            pitch_pc = np.bincount((pitch - tok.PITCH_OFFSET) % 12, minlength=12)
+            pitch_sig = tuple((pitch_pc / (pitch_pc.sum() + 1e-9)).round(2))
 
-            pitch_hist = np.bincount((pitch - tok.PITCH_OFFSET) % 12,
-                                     minlength=12)
-
-            pitch_sig = tuple((pitch_hist / (pitch_hist.sum() + 1e-9)).round(2))
-
-            bars = np.sum(arr == tok.BAR)
+            bars = int((arr == tok.BAR).sum())
             bar_bucket = (bars // 8) * 8
 
-            dur = arr[(arr >= tok.DUR_OFFSET) &
-                      (arr < tok.DUR_OFFSET + 16)]
-
-            dur_hist = np.bincount(dur - tok.DUR_OFFSET, minlength=16)
-
-            dur_sig = tuple((dur_hist / (dur_hist.sum() + 1e-9)).round(2))
+            dur = arr[(arr >= tok.DUR_OFFSET) & (arr < tok.DUR_OFFSET + 16)]
+            dur_pc = np.bincount(dur - tok.DUR_OFFSET, minlength=16)
+            dur_sig = tuple((dur_pc / (dur_pc.sum() + 1e-9)).round(2))
 
             fingerprints[(slots, pitch_sig, bar_bucket, dur_sig)] += 1
-
             progress.update(task, advance=1)
 
     near_dup = sum(v - 1 for v in fingerprints.values() if v > 1)
-
     console.print(f"  Near-duplicate files: {near_dup:,}")
 
     console.print("\n[bold green]Validation complete.[/bold green]")
