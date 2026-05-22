@@ -132,7 +132,7 @@ Token stats    — Total: 2,527,427,619 | Unique: 441 | Entropy: 5.68 bits | Dup
 ### Find the largest model that fits in your VRAM
 
 ```
-python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --sweep_models
+python train.py tokens_out --stats stats_out --seq_len 4096 --batch_size 1 --sweep_models
 ```
 
 Prints a table of model sizes with peak VRAM usage and a ready-to-paste training command.
@@ -141,13 +141,13 @@ Prints a table of model sizes with peak VRAM usage and a ready-to-paste training
 
 ```
 python train.py tokens_out --stats stats_out ^
-    --d_model 128 --n_layers 8 --seq_len 8192 --batch_size 1 --test_vram
+    --d_model 704 --n_layers 10 --seq_len 4096 --batch_size 1 --test_vram
 ```
 
 ### Train
 
 ```
-python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --grad_accum 8 --d_model 128 --n_layers 8 --epochs 1 --out run --sample_every 500
+python train.py tokens_out --stats stats_out --seq_len 4096 --batch_size 1 --grad_accum 8 --d_model 704 --n_layers 10 --epochs 1 --sample_every 500 --out run
 ```
 
 Auto-resumes from `run/checkpoints/latest` if it exists. Best val loss checkpoint always saved to `run/checkpoints/best`.
@@ -158,8 +158,8 @@ Auto-resumes from `run/checkpoints/latest` if it exists. Best val loss checkpoin
 
 ```
 python train.py tokens_out --stats stats_out ^
-    --d_model 128 --n_layers 8 ^
-    --seq_len 8192 --batch_size 1 --grad_accum 8 ^
+    --d_model 704 --n_layers 10 ^
+    --seq_len 4096 --batch_size 1 --grad_accum 8 ^
     --resume run/checkpoints/latest
 ```
 
@@ -309,7 +309,7 @@ Tests whether the model responds to conditioning (tempo, key, drums). Also check
 ### Profile training step
 
 ```
-python profile_step.py --seq_len 8192 --d_model 128 --n_layers 8 --stats stats_out
+python profile_step.py --seq_len 4096 --d_model 704 --n_layers 10 --stats stats_out
 ```
 
 Runs torch.profiler and prints ops sorted by CUDA time.
