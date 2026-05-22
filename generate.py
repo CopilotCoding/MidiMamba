@@ -145,7 +145,7 @@ def generate(
 
     B      = batch_size
     prefix = list(cond_prefix) + [tok.BOS]
-    states = model.init_states(B, device)
+    states = model.init_inference_states(B, device)
 
     all_tokens = [list(prefix) for _ in range(B)]
 

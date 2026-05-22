@@ -670,14 +670,18 @@ def main():
                             _cond = [_bc[f]["token_offset"] + _bc[f]["n_buckets"] // 2
                                      for f in _bc]
                             model.eval()
-                            _ids  = _gen(model, _cond, max_tokens=2000, silent=True, seed=step)
+                            _ids  = _gen(model, _cond, max_tokens=2000, min_tokens=100, silent=True, seed=step)
                             model.train()
                             _pm   = tok.decode(_ids)
                             _path = samples_dir / f"step_{step:07d}.mid"
                             _pm.write(str(_path))
                             _display["status"] = f"Sample → {_path.name}"
                         except Exception as _e:
+                            import traceback
                             _display["status"] = f"Sample failed: {_e}"
+                            # write to log so it's not lost in display refresh
+                            with open(out_dir / "sample_errors.log", "a") as _ef:
+                                _ef.write(f"step {step}: {traceback.format_exc()}\n")
 
             if _interrupted:
                 console.print("[yellow]Saving and exiting...[/yellow]")
