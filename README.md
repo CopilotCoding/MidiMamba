@@ -1,8 +1,8 @@
 # MidiGen3
 
-MIDI generation using a correct Mamba1 SSM. Pure PyTorch, Windows-compatible, bfloat16-native on RTX 30/40/50 series.
+**WIP:** MIDI generation using a Mamba SSM, implemented from scratch in pure PyTorch with no custom CUDA kernels. Trains on RTX 50-series (Blackwell sm_120) where the official mamba-ssm library doesn't run. Trained on 163K MIDI files, 2.5B tokens.
 
-Built from midigen2 with the core architecture bug fixed (x_ssm was a scalar per head — every feature in a head was identical, wasted capacity), bfloat16 training, per-batch dynamic padding, memmap dataset, and all utility scripts intact.
+Pure PyTorch, Windows-compatible, bfloat16-native. No mamba-ssm, no causal-conv1d, no Triton dependency.
 
 ---
 
@@ -69,7 +69,7 @@ python midideduper.py --path C:\midi\corpus
 Extracts features from every MIDI file, computes data-driven bucket boundaries, writes `corpus_stats.json` and `vocab_config.json`.
 
 ```
-python scan_dataset.py --dirs C:\midi\bach C:\midi\maestro C:\midi\giantmidi --out stats_out
+python scan_dataset.py --dirs C:\midi\corpus --out stats_out
 ```
 
 | Flag | Default | Description |
@@ -81,16 +81,14 @@ python scan_dataset.py --dirs C:\midi\bach C:\midi\maestro C:\midi\giantmidi --o
 
 Output: `stats_out/corpus_stats.json`, `stats_out/vocab_config.json`
 
-Prints a full corpus diversity report: key distribution, tempo histogram, bucket occupancy warnings, duplicate estimate.
-
 ---
 
 ## Step 2 — Build dataset
 
-Tokenizes all MIDI files to `.npy` token arrays. Uses pre-scanned features from Step 1 (no mido re-extraction). SHA256 deduplicates token sequences. Trims extreme outliers (sequences > 5x P99 length).
+Tokenizes all MIDI files to `.npy` token arrays. Uses pre-scanned features from Step 1. SHA256 deduplicates token sequences.
 
 ```
-python build_dataset.py --stats stats_out --dirs C:\midi\bach C:\midi\maestro C:\midi\giantmidi --out tokens_out
+python build_dataset.py --stats stats_out --dirs C:\midi\corpus --out tokens_out
 ```
 
 | Flag | Default | Description |
@@ -100,7 +98,7 @@ python build_dataset.py --stats stats_out --dirs C:\midi\bach C:\midi\maestro C:
 | `--out` | tokens_out | Output directory for *_tokens.npy files |
 | `--workers` | cpu_count-1 | Parallel worker processes |
 | `--limit` | 0 (all) | Cap files per directory |
-| `--chunk_size` | 500 | Files per IPC chunk (tune for Windows IPC overhead) |
+| `--chunk_size` | 500 | Files per IPC chunk |
 
 Output: `tokens_out/*.npy`, `tokens_out/manifest.json`, `tokens_out/errors.log`
 
@@ -108,7 +106,7 @@ Output: `tokens_out/*.npy`, `tokens_out/manifest.json`, `tokens_out/errors.log`
 
 ## Step 3 — Validate dataset (recommended)
 
-Check token distribution, entropy, sequence lengths, conditioning coverage, and near-duplicates before spending GPU time on a bad dataset.
+Check token distribution, entropy, sequence lengths, and near-duplicates before spending GPU time.
 
 ```
 python validate_tokens.py --data tokens_out --stats stats_out
@@ -118,25 +116,14 @@ python validate_tokens.py --data tokens_out --stats stats_out
 |---|---|---|
 | `--data` | required | tokens_out directory from Step 2 |
 | `--stats` | required | stats_out directory from Step 1 |
-| `--top_n` | 100 | How many top tokens to show in frequency table |
+| `--top_n` | 100 | Top N tokens to show in frequency table |
 | `--max_files` | 0 (all) | Cap files to sample |
 
-Watch for: low entropy warnings, skewed conditioning dimensions, dead tokens > 30%, near-duplicate rate > 20%.
-
-Example output: 
-Sequence stats 
-Files: 163,068 
-Min: 131 
-Avg: 15,499 
-P50: 13,573 
-P90: 31,029 
-P99: 53,173 
-Max: 150,889 
-Token stats 
-Total tokens: 2,527,427,619 
-Unique tokens: 441 
-Entropy: 5.68 bits 
-Duplicates: 0
+Example output on a healthy corpus:
+```
+Sequence stats — Files: 163,068 | Min: 131 | Avg: 15,499 | P50: 13,573 | P90: 31,029 | P99: 53,173 | Max: 150,889
+Token stats    — Total: 2,527,427,619 | Unique: 441 | Entropy: 5.68 bits | Duplicates: 0
+```
 
 ---
 
@@ -144,18 +131,17 @@ Duplicates: 0
 
 ### Find the largest model that fits in your VRAM
 
-Run the sweep before committing to a config. Tests increasing model sizes with a real forward+backward pass and reports peak VRAM.
-
 ```
-python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --sweep_models --grad_checkpoint --compile
+python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --sweep_models
 ```
 
-Prints a table and outputs a ready-to-paste training command at the bottom.
+Prints a table of model sizes with peak VRAM usage and a ready-to-paste training command.
 
 ### Test VRAM for a specific config
 
 ```
-python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_len 16384 --batch_size 1 --test_vram
+python train.py tokens_out --stats stats_out ^
+    --d_model 128 --n_layers 8 --seq_len 8192 --batch_size 1 --test_vram
 ```
 
 ### Train
@@ -166,10 +152,15 @@ python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --gra
 
 Auto-resumes from `run/checkpoints/latest` if it exists. Best val loss checkpoint always saved to `run/checkpoints/best`.
 
+> **Note:** `--compile` is supported but may hang on Windows (Triton not available). Leave it off unless you're on Linux.
+
 ### Resume explicitly
 
 ```
-python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_len 16384 --batch_size 1 --grad_accum 8 --resume run/checkpoints/latest
+python train.py tokens_out --stats stats_out ^
+    --d_model 128 --n_layers 8 ^
+    --seq_len 8192 --batch_size 1 --grad_accum 8 ^
+    --resume run/checkpoints/latest
 ```
 
 ### All training flags
@@ -183,47 +174,35 @@ python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_l
 | **Model** | | |
 | `--d_model` | 512 | Model dimension |
 | `--n_layers` | 12 | Number of layers |
-| `--d_state` | 32 | SSM state size per feature dim |
 | `--d_conv` | 4 | Causal conv kernel size |
 | `--expand` | 2 | d_inner = d_model * expand |
 | `--d_ff_mult` | 2.667 | SwiGLU expansion multiplier |
 | `--dropout` | 0.1 | Dropout rate |
-| `--grad_checkpoint` | off | Gradient checkpointing (saves VRAM, slows training ~20%) |
+| `--grad_checkpoint` | off | Gradient checkpointing (saves VRAM, ~20% slower) |
 | **Training** | | |
 | `--seq_len` | 16384 | Max sequence length |
 | `--batch_size` | 1 | Sequences per GPU step |
-| `--grad_accum` | 8 | Gradient accumulation steps (effective batch = batch_size * grad_accum) |
-| `--epochs` | 10 | Training epochs |
+| `--grad_accum` | 8 | Gradient accumulation steps |
+| `--epochs` | 10 | Training epochs (1 epoch = full corpus pass; on 2.5B tokens, 1–2 is typical) |
 | `--lr` | 3e-4 | Peak learning rate |
 | `--min_lr` | 3e-5 | Minimum LR at end of cosine schedule |
-| `--warmup_frac` | 0.02 | Fraction of total steps used for LR warmup |
+| `--warmup_frac` | 0.02 | Fraction of total steps for LR warmup |
 | `--weight_decay` | 0.1 | AdamW weight decay |
 | `--grad_clip` | 1.0 | Gradient norm clip |
-| `--compile` | off | Attempt torch.compile (Windows: may silently fall back to eager) |
+| `--compile` | off | Attempt torch.compile (may hang on Windows) |
 | **Dataset** | | |
 | `--val_frac` | 0.02 | Fraction of files held out for validation |
 | `--min_tokens` | 256 | Minimum sequence length to include |
 | `--num_workers` | 0 | DataLoader workers (keep 0 on Windows with memmap) |
 | **Checkpointing** | | |
 | `--val_every` | 500 | Validate every N optimizer steps |
-| `--val_batches` | 50 | Number of validation batches per eval |
+| `--val_batches` | 50 | Validation batches per eval |
 | `--ckpt_every` | 1000 | Save latest checkpoint every N steps |
 | `--ckpt_minutes` | 30 | Also save a timestamped checkpoint every N minutes |
 | `--sample_every` | 0 | Auto-generate a sample MIDI every N steps (0 = off) |
 | **Utility modes** | | |
 | `--sweep_models` | off | VRAM sweep across model sizes, then exit |
 | `--test_vram` | off | Single forward+backward VRAM test, then exit |
-
-### Recommended configs by VRAM
-
-These are starting points. Run `--sweep_models` to confirm on your hardware.
-
-| VRAM | d_model | n_layers | ~Params | seq_len | batch | grad_accum |
-|---|---|---|---|---|---|---|
-| 8 GB | 512 | 12 | ~85M | 8192 | 1 | 8 |
-| 16 GB | 768 | 16 | ~245M | 16384 | 1 | 8 |
-| 24 GB | 768 | 20 | ~305M | 16384 | 2 | 4 |
-| 24 GB | 896 | 20 | ~415M | 16384 | 1 | 8 |
 
 ---
 
@@ -238,43 +217,38 @@ python generate.py run/checkpoints/best output.mid
 ### Conditioned generation
 
 ```
-python generate.py run/checkpoints/best output.mid --tempo 120 --key_root 0 --key_minor 0 --has_drums 1 --note_density 8
+python generate.py run/checkpoints/best output.mid ^
+    --tempo 120 --key_root 0 --key_minor 0 --has_drums 1
 ```
 
-### Batch generation — N variations in parallel
+### Batch — N variations in parallel
 
 ```
 python generate.py run/checkpoints/best output.mid --batch 4
 ```
 
-Writes `output_00.mid`, `output_01.mid`, `output_02.mid`, `output_03.mid`.
-
-### Long piece
-
-```
-python generate.py run/checkpoints/best output.mid --max_tokens 80000 --min_tokens 10000 --temperature 0.95
-```
+Writes `output_00.mid`, `output_01.mid`, etc.
 
 ### All generation flags
 
 | Flag | Default | Description |
 |---|---|---|
-| `checkpoint` | required (positional) | Checkpoint directory (contains model.pt + meta.json) |
+| `checkpoint` | required (positional) | Checkpoint directory |
 | `output` | required (positional) | Output .mid path (stem for --batch > 1) |
-| `--batch` | 1 | Generate N variations in parallel on GPU |
+| `--batch` | 1 | Generate N variations in parallel |
 | `--max_tokens` | 50000 | Maximum tokens to generate |
 | `--min_tokens` | 4000 | Minimum tokens before EOS is allowed |
-| `--temperature` | 0.92 | Sampling temperature (higher = more random) |
+| `--temperature` | 0.92 | Sampling temperature |
 | `--top_p` | 0.93 | Nucleus sampling cutoff |
 | `--seed` | None | Random seed for reproducibility |
 | `--rep_penalty` | 1.08 | Pitch repetition penalty (1.0 = off) |
 | `--rep_window` | 256 | Token window for repetition penalty |
 
-### Conditioning flags (all optional — omitting uses neutral mid-bucket)
+### Conditioning flags (all optional)
 
 | Flag | Type | Description |
 |---|---|---|
-| `--tempo` | float | BPM (e.g. 120.0) |
+| `--tempo` | float | BPM |
 | `--duration_sec` | float | Target duration in seconds |
 | `--n_bars` | int | Target bar count |
 | `--pitch_min` | int | Lowest pitch (21–108) |
@@ -285,16 +259,16 @@ python generate.py run/checkpoints/best output.mid --max_tokens 80000 --min_toke
 | `--polyphony` | float | Average simultaneous notes |
 | `--rest_density` | float | Fraction of time silent (0–1) |
 | `--total_notes` | int | Total note count |
-| `--ioi_cv` | float | Rhythmic irregularity (0–3, higher = more irregular) |
+| `--ioi_cv` | float | Rhythmic irregularity (0–3) |
 | `--pitch_variety` | float | Pitch variety (0–1) |
 | `--interval_diversity` | float | Average melodic interval size |
-| `--ts_num` | int | Time signature numerator (e.g. 4) |
-| `--ts_den` | int | Time signature denominator (e.g. 4) |
-| `--key_root` | int | Key root: 0=C, 1=C#, 2=D, 3=Eb, 4=E, 5=F, 6=F#, 7=G, 8=Ab, 9=A, 10=Bb, 11=B |
+| `--ts_num` | int | Time signature numerator |
+| `--ts_den` | int | Time signature denominator |
+| `--key_root` | int | 0=C, 1=C#, 2=D, 3=Eb, 4=E, 5=F, 6=F#, 7=G, 8=Ab, 9=A, 10=Bb, 11=B |
 | `--key_minor` | int | 0 = major, 1 = minor |
-| `--key_detected` | int | 1 = key signature present in source data |
+| `--key_detected` | int | 1 = key signature present |
 | `--n_tracks` | int | Number of instrument tracks |
-| `--has_drums` | int | 1 = drums present, 0 = no drums |
+| `--has_drums` | int | 1 = drums, 0 = no drums |
 | `--midi_format` | int | MIDI format: 0 or 1 |
 
 ---
@@ -303,28 +277,28 @@ python generate.py run/checkpoints/best output.mid --max_tokens 80000 --min_toke
 
 ### Objective quality metrics
 
-Generates N samples and computes: duplicate note %, n-gram repeat rate, unique token ratio, pitch entropy, note density, bar-to-bar similarity. Flags models with repetition or monotone output.
-
 ```
 python eval_generated.py run/checkpoints/best --stats stats_out --n 20
 ```
 
+Generates N samples and computes duplicate note %, n-gram repeat rate, unique token ratio, pitch entropy, note density, bar similarity.
+
 | Flag | Default | Description |
 |---|---|---|
-| `checkpoint` | required (positional) | Checkpoint directory |
+| `checkpoint` | required | Checkpoint directory |
 | `--stats` | required | stats_out directory |
-| `--n` | 20 | Number of samples to generate and evaluate |
+| `--n` | 20 | Number of samples to evaluate |
 | `--max_tokens` | 8000 | Tokens per sample |
 | `--temperature` | 0.92 | Sampling temperature |
 | `--top_p` | 0.93 | Nucleus sampling cutoff |
 
-### Conditioning response + SSM coherence diagnostic
-
-Tests whether the model actually responds to conditioning (e.g. high tempo vs low tempo, major vs minor, drums vs no drums). Also checks for conditioning token leakage into the music section.
+### Conditioning response diagnostic
 
 ```
 python diagnostic.py --checkpoint run/checkpoints/best --vocab stats_out/vocab_config.json
 ```
+
+Tests whether the model responds to conditioning (tempo, key, drums). Also checks for conditioning token leakage.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -332,13 +306,13 @@ python diagnostic.py --checkpoint run/checkpoints/best --vocab stats_out/vocab_c
 | `--vocab` | stats_out/vocab_config.json | vocab_config.json path |
 | `--tokens` | 600 | Tokens per test generation |
 
-### Profile training step (find bottlenecks)
-
-Runs torch.profiler for N steps at a given seq_len and prints ops sorted by CUDA time. Compare seq_len=8192 vs seq_len=32768 to find what grows superlinearly.
+### Profile training step
 
 ```
-python profile_step.py --seq_len 16384 --d_model 768 --n_layers 16 --stats stats_out
+python profile_step.py --seq_len 8192 --d_model 128 --n_layers 8 --stats stats_out
 ```
+
+Runs torch.profiler and prints ops sorted by CUDA time.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -346,80 +320,50 @@ python profile_step.py --seq_len 16384 --d_model 768 --n_layers 16 --stats stats
 | `--d_model` | 512 | Model dimension |
 | `--n_layers` | 16 | Number of layers |
 | `--grad_checkpoint` | on | Use gradient checkpointing |
-| `--no_checkpoint` | — | Disable gradient checkpointing |
-| `--steps` | 6 | Number of steps to profile |
-| `--stats` | stats_out | stats_out directory (for vocab size) |
+| `--steps` | 6 | Steps to profile |
+| `--stats` | stats_out | stats_out directory |
 
 ---
 
 ## Testing
 
-### SSM scan correctness
-
-Verifies `_ssm_scan` against a sequential reference loop at multiple sequence lengths. Run this after any changes to model.py.
-
 ```
-python test_scan.py
-```
-
-All cases should print `[PASS]`. If any print `[FAIL]` the scan math is broken.
-
-### SSM scan benchmark
-
-Correctness + gradient check + wall-clock throughput. Useful for confirming performance on new hardware.
-
-```
-python bench_scan.py
+python test_scan.py    # correctness — all cases should print [PASS]
+python bench_scan.py   # correctness + gradient check + throughput
 ```
 
 ---
 
 ## Output structure
 
-After training:
-
 ```
 run/
   checkpoints/
-    best/           — best validation loss checkpoint
+    best/             — best validation loss checkpoint
       model.pt
       optimizer.pt
       meta.json
-    latest/         — most recent checkpoint (auto-resume target)
-    step_0001000/   — timed permanent checkpoints
-    step_0002000/
-  samples/          — auto-generated MIDI samples (if --sample_every > 0)
-    step_0001000.mid
-  loss_log.csv      — step, train_loss, val_loss, lr
-```
-
-`meta.json` contains everything needed to reload the model:
-
-```json
-{
-  "step": 12500,
-  "epoch": 3,
-  "best_val": 1.8432,
-  "vocab_config": "stats_out/vocab_config.json",
-  "model_cfg": {
-    "vocab_size": 442,
-    "d_model": 768,
-    "n_layers": 16,
-    ...
-  }
-}
+    latest/           — most recent checkpoint (auto-resume target)
+    step_0001000/     — timed permanent checkpoints
+  samples/            — auto-generated MIDI (if --sample_every > 0)
+  loss_log.csv        — step, train_loss, val_loss, lr
 ```
 
 ---
 
-## Architecture notes
+## Architecture
 
-**Model:** Mamba1 SSM. `A_log`, `dt_bias`, `D` are `(d_inner,)` — one parameter per feature dimension. State per layer per batch element is `(d_inner, d_state)`. No multi-head grouping.
+**SSM:** Mamba1 with d_state=1. The state per feature is a single scalar, making the scan a closed-form cumprod + cumsum — two fused GPU ops, no Python loop, no OOM risk, numerically stable. This is the only approach that works without custom CUDA kernels on Blackwell (sm_120).
 
-**SSM scan:** Hillis-Steele parallel prefix scan, chunked across sequence for memory efficiency. CHUNK=2048 means ~8 sequential carry iterations at seq_len=16384. fp32 accumulation, cast back to input dtype on return.
+**Scan:**
+```
+L[t]     = cumprod(dA, dim=1)           cumulative decay
+h[t]     = L[t] * cumsum(dBx/L, dim=1) hidden states  
+y[t]     = h[t] * C[t]                 readout
+```
 
-**Tokenizer:** BAR / SECTION / TEMPO / POS / TRACK / PITCH / DUR / VEL token schema. Conditioning prefix prepended to every sequence — data-driven bucket boundaries computed from corpus statistics, not hardcoded. Token layout is identical to midigen2; existing tokenized datasets are compatible.
+**Tokenizer:** BAR / SECTION / TEMPO / POS / TRACK / PITCH / DUR / VEL schema. Conditioning prefix prepended to every sequence with data-driven bucket boundaries from corpus statistics. 442 total tokens.
 
-**Training:** bfloat16 autocast (native on sm_86+, including RTX 5060 Ti sm_100). Fused AdamW. Cosine LR with warmup. Per-batch dynamic padding via `PadCollator` — sequences padded to longest in batch, not to global max_seq. Memmap dataset — no full corpus preload.
+**Training:** bfloat16 autocast (native on sm_86+). Fused AdamW. Cosine LR with warmup. Per-batch dynamic padding — sequences padded to longest in batch, not global max_seq. Memmap dataset — no full corpus preload.
 
-**Inference:** Recurrent step mode — O(1) memory and compute per token regardless of sequence length. No context window limit.
+**Inference:** Recurrent step mode — O(1) memory and compute per token, no context window limit.
