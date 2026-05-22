@@ -364,6 +364,6 @@ y[t]     = h[t] * C[t]                 readout
 
 **Tokenizer:** BAR / SECTION / TEMPO / POS / TRACK / PITCH / DUR / VEL schema. Conditioning prefix prepended to every sequence with data-driven bucket boundaries from corpus statistics. 442 total tokens.
 
-**Training:** bfloat16 autocast (native on sm_86+). Fused AdamW. Cosine LR with warmup. Per-batch dynamic padding — sequences padded to longest in batch, not global max_seq. Memmap dataset — no full corpus preload.
+**Training:** bfloat16 autocast (native on sm_86+). Fused AdamW. Cosine LR with warmup. Memmap dataset — no full corpus preload. Songs longer than `seq_len` are split into chunks; the SSM hidden state is threaded across chunks of the same song and reset only at song boundaries. Gradients flow within each chunk only (TBPTT). Shuffle happens at song level so chunks always arrive in order.
 
 **Inference:** Recurrent step mode — O(1) memory and compute per token, no context window limit.

@@ -623,7 +623,11 @@ def main():
             model.train()
             optimizer.zero_grad()
 
-            for batch_idx, (x, y) in enumerate(train_loader):
+            # SSM state persisted across chunks of the same song, reset at boundaries
+            ssm_states = model.init_states(args.batch_size, device)
+            current_song_id = None
+
+            for batch_idx, (x, y, song_ids, is_lasts) in enumerate(train_loader):
                 if _interrupted:
                     break
 
@@ -632,13 +636,21 @@ def main():
                 tokens_this_accum += x.numel()   # actual tokens in this batch (post-padding)
                 _display["status"] = "Training..."
 
+                # Reset state at song boundary (new song_id)
+                if song_ids[0] != current_song_id:
+                    ssm_states = model.init_states(args.batch_size, device)
+                    current_song_id = song_ids[0]
+
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-                    logits, _ = model(x)
+                    logits, new_states = model(x, ssm_states)
                     loss = F.cross_entropy(
                         logits.reshape(-1, tok.VOCAB_SIZE),
                         y.reshape(-1),
                         ignore_index=tok.PAD,
                     ) / args.grad_accum
+
+                # Detach states: backprop within chunk only (TBPTT), not through full song
+                ssm_states = [s.detach() for s in new_states]
 
                 if use_scaler:
                     scaler.scale(loss).backward()
@@ -681,7 +693,7 @@ def main():
                         model.eval()
                         vlosses = []
                         with torch.no_grad():
-                            for vx, vy in val_loader:
+                            for vx, vy, _sids, _ilasts in val_loader:
                                 if len(vlosses) >= args.val_batches: break
                                 with torch.amp.autocast("cuda", dtype=amp_dtype,
                                                         enabled=(device.type == "cuda")):

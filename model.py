@@ -97,17 +97,21 @@ def _ssm_scan(
     dA:  torch.Tensor,   # (B, T, F)  decay values in (0, 1)
     dBx: torch.Tensor,   # (B, T, F)  input: dB[t] * x[t]  (scalar, d_state=1)
     C:   torch.Tensor,   # (B, T, F)  output projection     (scalar, d_state=1)
-) -> torch.Tensor:
+    h0:  torch.Tensor,   # (B, F)     initial hidden state (carry-in from prev chunk)
+) -> tuple:
     """
-    Returns y: (B, T, F)
-    All inputs fp32. Output cast back to caller's dtype handled by MambaBlock.
+    Returns (y, h_last): (B, T, F), (B, F)
+    h0 allows state to be threaded across chunks of the same song.
+    All inputs fp32.
     """
-    # cumulative decay — safe because dA in (1e-6, 1-1e-6) and T<=32768
-    # minimum value: (1-1e-6)^32768 ≈ 0.97, never zero
+    # Closed-form solution accounting for non-zero initial state h0:
+    # h[t] = L[t] * (h0 + cumsum(dBx/L))
+    # where the h0 term contributes L[t] * h0 at every timestep
     L        = torch.cumprod(dA, dim=1)                    # (B, T, F)
     dBx_norm = dBx / L.clamp(min=1e-6)                    # (B, T, F)
-    h        = L * torch.cumsum(dBx_norm, dim=1)          # (B, T, F)
-    return h * C                                           # (B, T, F)
+    h        = L * (h0.unsqueeze(1) + torch.cumsum(dBx_norm, dim=1))  # (B, T, F)
+    h_last   = h[:, -1, :]                                # (B, F)
+    return h * C, h_last                                   # (B, T, F), (B, F)
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +152,8 @@ class MambaBlock(nn.Module):
         nn.init.constant_(self.dt_bias, math.log(math.expm1(1.0)))
         nn.init.uniform_(self.A_log, -2.0, -0.5)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> tuple:
+        """Returns (output, h_last). h0: (B, F) initial hidden state."""
         dtype = x.dtype
         B, T, _ = x.shape
         F_dim = self.d_inner
@@ -171,14 +176,15 @@ class MambaBlock(nn.Module):
 
         dBx = B_proj * x_norm * dt                          # (B, T, F)
 
-        # scan in fp32 for stability
-        y = _ssm_scan(dA.float(), dBx.float(), C_proj.float()).to(dtype)
+        # scan in fp32 for stability, thread h0 from previous chunk
+        y, h_last = _ssm_scan(dA.float(), dBx.float(), C_proj.float(), h0.float())
+        y = y.to(dtype)
         y = y + self.D * x_norm
 
-        return self.drop(self.out_proj(y * F.silu(z)))
+        return self.drop(self.out_proj(y * F.silu(z))), h_last.to(dtype)
 
-    def step(self, x: torch.Tensor, ssm_state: torch.Tensor, conv_state: torch.Tensor):
-        """Single-token recurrent step. ssm_state: (B, F) scalar per feature."""
+    def step(self, x: torch.Tensor, h_state: torch.Tensor, conv_state: torch.Tensor):
+        """Single-token recurrent step. h_state: (B, F) scalar SSM state."""
         if x.dim() == 3:
             x = x.squeeze(1)
         B     = x.shape[0]
@@ -203,12 +209,12 @@ class MambaBlock(nn.Module):
         A   = -torch.exp(self.A_log)
         dA  = torch.exp(dt * A).clamp(1e-6, 1 - 1e-6)      # (B, F)
 
-        dBx     = B_proj * x_norm * dt                      # (B, F)
-        new_ssm = dA * ssm_state + dBx                      # (B, F)
-        y       = new_ssm * C_proj + self.D * x_norm        # (B, F)
+        dBx    = B_proj * x_norm * dt                       # (B, F)
+        new_h  = dA * h_state + dBx                         # (B, F)
+        y      = new_h * C_proj + self.D * x_norm           # (B, F)
 
         out = self.drop(self.out_proj(y * F.silu(z)))
-        return out, new_ssm, new_conv
+        return out, new_h, new_conv
 
 
 # --------------------------------------------------------------------------- #
@@ -224,16 +230,17 @@ class MambaLayer(nn.Module):
         self.mlp   = SwiGLU(cfg.d_model, cfg.d_ff_mult)
         self.drop  = nn.Dropout(cfg.dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.ssm(self.norm1(x))
+    def forward(self, x: torch.Tensor, h0: torch.Tensor) -> tuple:
+        ssm_out, h_last = self.ssm(self.norm1(x), h0)
+        x = x + ssm_out
         x = x + self.drop(self.mlp(self.norm2(x)))
-        return x
+        return x, h_last
 
-    def step(self, x: torch.Tensor, ssm_state: torch.Tensor, conv_state: torch.Tensor):
-        h, new_ssm, new_conv = self.ssm.step(self.norm1(x), ssm_state, conv_state)
+    def step(self, x: torch.Tensor, h_state: torch.Tensor, conv_state: torch.Tensor):
+        h, new_h, new_conv = self.ssm.step(self.norm1(x), h_state, conv_state)
         x = x.squeeze(1) + h
         x = x + self.drop(self.mlp(self.norm2(x)))
-        return x, new_ssm, new_conv
+        return x, new_h, new_conv
 
 
 class MidiMamba(nn.Module):
@@ -250,32 +257,41 @@ class MidiMamba(nn.Module):
 
     def forward(self, idx: torch.Tensor, states=None):
         x = self.drop(self.embed(idx))
-        for layer in self.layers:
+        B = x.shape[0]
+        new_states = []
+        for i, layer in enumerate(self.layers):
+            h0 = states[i] if states is not None else torch.zeros(B, self.cfg.d_inner, device=x.device, dtype=x.dtype)
             if self.cfg.grad_ckpt:
-                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+                x, h_last = torch.utils.checkpoint.checkpoint(layer, x, h0, use_reentrant=False)
             else:
-                x = layer(x)
-        return self.head(self.norm(x)), []
+                x, h_last = layer(x, h0)
+            new_states.append(h_last)
+        return self.head(self.norm(x)), new_states
 
     def step(self, idx: torch.Tensor, states: list):
+        """states: list of (h_state, conv_state) per layer for inference."""
         x = self.embed(idx)
         new_states = []
         for i, layer in enumerate(self.layers):
-            ssm_s, conv_s = states[i]
-            x_out, new_ssm, new_conv = layer.step(x, ssm_s, conv_s)
+            h_s, conv_s = states[i]
+            x_out, new_h, new_conv = layer.step(x, h_s, conv_s)
             x = x_out.unsqueeze(1)
-            new_states.append((new_ssm, new_conv))
+            new_states.append((new_h, new_conv))
         return self.head(self.norm(x)), new_states
 
     def init_states(self, batch_size: int, device: torch.device) -> list:
-        """ssm_state is now (B, F) — scalar per feature, d_state=1."""
+        """Training: returns list of (B, F) h tensors, one per layer."""
         F_dim = self.cfg.d_inner
-        states = []
-        for _ in self.layers:
-            ssm  = torch.zeros(batch_size, F_dim, device=device)
-            conv = torch.zeros(batch_size, F_dim, self.cfg.d_conv - 1, device=device)
-            states.append((ssm, conv))
-        return states
+        return [torch.zeros(batch_size, F_dim, device=device) for _ in self.layers]
+
+    def init_inference_states(self, batch_size: int, device: torch.device) -> list:
+        """Inference: returns list of (h_state, conv_state) tuples per layer."""
+        F_dim = self.cfg.d_inner
+        return [
+            (torch.zeros(batch_size, F_dim, device=device),
+             torch.zeros(batch_size, F_dim, self.cfg.d_conv - 1, device=device))
+            for _ in self.layers
+        ]
 
     def param_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
