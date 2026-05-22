@@ -1,6 +1,6 @@
 # MidiGen3
 
-**WIP:** MIDI generation using a Mamba SSM, implemented from scratch in pure PyTorch with no custom CUDA kernels. Trains on RTX 50-series (Blackwell sm_120) where the official mamba-ssm library doesn't run. Trained on 163K MIDI files, 2.5B tokens.
+**WIP:** MIDI generation using SM1 (Scalar Mamba 1), a novel SSM variant implemented from scratch in pure PyTorch with no custom CUDA kernels. Trains on RTX 50-series (Blackwell sm_120) where the official mamba-ssm library doesn't run. Trained on 163K MIDI files, 2.5B tokens.
 
 Pure PyTorch, Windows-compatible, bfloat16-native. No mamba-ssm, no causal-conv1d, no Triton dependency.
 
@@ -353,7 +353,7 @@ run/
 
 ## Architecture
 
-**SSM:** Mamba1 with d_state=1. The state per feature is a single scalar, making the scan a closed-form cumprod + cumsum — two fused GPU ops, no Python loop, no OOM risk, numerically stable. This is the only approach that works without custom CUDA kernels on Blackwell (sm_120).
+**SSM:** SM1 (Scalar Mamba 1) — a Mamba1 variant with d_state=1. The state per feature is a single scalar, enabling an exact closed-form scan via cumprod + cumsum: two vectorized GPU ops, no Python loop, no OOM risk, numerically stable. SM1 is the only Mamba formulation that admits this closed-form without custom CUDA kernels, making it viable on Blackwell (sm_120) where mamba-ssm is unsupported.
 
 **Scan:**
 ```
