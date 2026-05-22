@@ -184,6 +184,7 @@ def main():
         vocab_config = json.load(f)
 
     cfg_dict = meta["model_cfg"]
+    cfg_dict.pop("n_heads", None)   # midigen2 checkpoints may have n_heads — not in ModelConfig
     cfg = ModelConfig(**cfg_dict)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

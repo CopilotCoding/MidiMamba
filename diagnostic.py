@@ -22,7 +22,9 @@ from generate import generate, build_cond_prefix
 def load_model(ckpt_dir):
     ckpt_dir = Path(ckpt_dir)
     meta = json.load(open(ckpt_dir / "meta.json"))
-    cfg = ModelConfig(**meta["model_cfg"])
+    cfg_dict = meta["model_cfg"]
+    cfg_dict.pop("n_heads", None)
+    cfg = ModelConfig(**cfg_dict)
     model = MidiMamba(cfg)
     model.load_state_dict(torch.load(ckpt_dir / "model.pt", map_location="cpu"))
     model.eval()
@@ -169,7 +171,7 @@ def main():
     model, meta, cfg = load_model(args.checkpoint)
     print(f"  Step: {meta['step']}")
     print(f"  Best val: {meta['best_val']:.4f}")
-    print(f"  Config: d={cfg.d_model} L={cfg.n_layers} H={cfg.n_heads} S={cfg.d_state}")
+    print(f"  Config: d={cfg.d_model} L={cfg.n_layers} S={cfg.d_state}")
     print(f"  Params: {model.param_count_str()}")
 
     test_conditioning_response(model, vocab_config, n_tokens=args.tokens)

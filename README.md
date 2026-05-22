@@ -1,445 +1,410 @@
-# MidiMamba — Long-Context MIDI Generation
+# MidiGen3
 
-Mamba-based MIDI generation model designed for full-song coherence at 50K+ token context.
-No sliding window. No repetition collapse. Linear memory scaling.
+MIDI generation using a correct Mamba1 SSM. Pure PyTorch, Windows-compatible, bfloat16-native on RTX 30/40/50 series.
 
-Pure PyTorch — no external CUDA compilation, works on Windows and Linux.
-
----
-
-## Why Mamba?
-
-Standard transformers use quadratic attention — at 50K tokens, memory explodes.
-Mamba's SSM state carries full history in a fixed-size recurrent state at O(1) memory per step.
-The model can generate hour-long pieces without ever losing context of what it already played.
-
-Two modes:
-- **Training** — segmented cumsum scan over full sequence, ~1662 Python iterations for T=53K (SEG=32), pure CUDA ops within each segment
-- **Inference** — single-token recurrent step, O(1) memory regardless of sequence length
-
-### What makes this implementation different
-
-- **53K context on a small model.** Standard practice scales context and parameters together. This project runs extreme context on a small model, forcing compression rather than memorization — closer to how biological memory works than most ML systems.
-- **Pure PyTorch SSM.** No mamba-ssm, no bitsandbytes, no flash-attention. Everything is PyTorch primitives. Runs anywhere PyTorch runs, on any OS, on consumer hardware.
-- **Data quality over quantity.** SHA256 dedup at file level and token sequence level, 12-byte pre-filter before any parsing, scanner-derived rejection criteria. Cleaner than most published MIDI generation datasets.
-- **Conditioning vocab built from scan output.** Bucket boundaries represent real percentiles of your actual corpus, not hardcoded ranges.
-- **Verified correct SSM scan.** The segmented cumsum scan is tested against a sequential reference implementation at every sequence length. Previous implementations silently produced wrong gradients — the test suite catches this.
+Built from midigen2 with the core architecture bug fixed (x_ssm was a scalar per head — every feature in a head was identical, wasted capacity), bfloat16 training, per-batch dynamic padding, memmap dataset, and all utility scripts intact.
 
 ---
 
-## Pipeline
+## Installation
 
 ```
-0. midideduper.py     — SHA256 dedup your raw MIDI files before anything else
-1. scan_dataset.py    — pre-filter + scan MIDI files, build auto-bucketed vocab config
-2. build_dataset.py   — tokenize using scan results, deduplicate, trim outliers
-3. validate_tokens.py — validate token distribution, near-dupes, dead tokens
-4. train.py           — train with hash-based train/val split (no leakage)
-5. generate.py        — generate MIDI with optional conditioning
-6. eval_generated.py  — objective quality metrics on generated samples
-7. diagnostic.py      — conditioning response + SSM state coherence tests
-8. test_scan.py       — verify scan correctness against sequential reference
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install pretty_midi mido numpy rich
 ```
+
+`requirements.txt` lists the full set. PyTorch 2.4+ required for bfloat16 autocast and fused AdamW.
 
 ---
 
-## Setup
+## Pipeline overview
 
-Install PyTorch first (preserve your CUDA build):
 ```
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
-
-Verify CUDA:
-```
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-```
-
-Install the rest:
-```
-pip install -r requirements.txt
+Raw MIDI files
+    │
+    ▼
+midideduper.py          (optional) deduplicate raw MIDI by file hash
+    │
+    ▼
+scan_dataset.py         Phase 1 — extract features, compute auto-buckets, write vocab_config.json
+    │
+    ▼
+build_dataset.py        Phase 2 — tokenize all MIDI to .npy token arrays
+    │
+    ▼
+validate_tokens.py      (optional but recommended) verify dataset health before training
+    │
+    ▼
+train.py                Train the model
+    │
+    ▼
+eval_generated.py       Objective quality metrics on generated samples
+diagnostic.py           Conditioning response + SSM coherence tests
+    │
+    ▼
+generate.py             Generate MIDI from a checkpoint
 ```
 
 ---
 
-## Data Preparation
+## Step 0 — Deduplicate raw MIDI (optional)
 
-**Deduplicate your raw MIDI files first.** Datasets like GiantMIDI contain many files with
-different filenames but identical byte content — the same transcription saved under multiple
-names. Training on raw GiantMIDI means certain pieces get over-represented at 3-10x without
-any visible indication.
-
-Use the included `midideduper.py` to SHA256-deduplicate your raw files, keeping the oldest
-copy per hash:
+Remove exact duplicate MIDI files from your corpus before scanning. Keeps the oldest copy by creation time.
 
 ```
-# Dry run first — see what would be deleted
-python midideduper.py --path "path/to/midi" --dry-run
-
-# Actually delete duplicates
-python midideduper.py --path "path/to/midi"
+python midideduper.py --path C:\midi\corpus
 ```
 
-After deduplication, GiantMIDI typically loses 15-25% of its files. A log of all kept and
-deleted files is written to `dedupe_log.txt`.
-
-On Windows, `rglob("*.mid")` and `rglob("*.MID")` both match the same files on
-case-insensitive NTFS. The scanner and tokenizer both deduplicate by lowercase path.
+| Flag | Default | Description |
+|---|---|---|
+| `--path` | required | Root directory to scan recursively |
+| `--workers` | 12 | Parallel hash workers |
+| `--dry-run` | off | Report duplicates without deleting |
+| `--log` | dedupe_log.txt | Log file path |
 
 ---
 
-## Step 1: Scan Dataset
+## Step 1 — Scan dataset
 
-Scans all MIDI folders, extracts every measurable feature, and auto-computes data-driven
-bucket boundaries for each conditioning dimension.
-
-### Pre-filter (12 bytes, no parsing)
-
-Every file is rejected before any MIDI library opens it if:
-- File size outside 512 bytes – 20MB
-- Double extensions (`.mid.mid`)
-- Magic bytes are not `MThd`
-- Header chunk size is not exactly 6
-- MIDI format is not 0, 1, or 2
-- Track count is 0 or >256
-- Format 0 has more than 1 track; format 1 has fewer than 2
-
-### Feature extraction
-
-Uses mido for raw MIDI parsing — no piano roll, no beat tracking. All features computed
-directly from note events via sweep line arithmetic and O(log N) tempo conversion.
-
-- **Note pairing** — LIFO stack per (channel, note) pair, correct for overlapping note-ons
-- **Tempo** — duration-weighted average BPM, O(log N) binary search via tempo index
-- **key_detected** — distinguishes real key signatures from C major defaults
-- **has_drums** — detected via channel 9; conditioning token allows drum-free generation
+Extracts features from every MIDI file, computes data-driven bucket boundaries, writes `corpus_stats.json` and `vocab_config.json`.
 
 ```
-python scan_dataset.py --dirs "path/to/midi" --out stats_out
+python scan_dataset.py --dirs C:\midi\bach C:\midi\maestro C:\midi\giantmidi --out stats_out
 ```
 
-Outputs:
-- `stats_out/corpus_stats.json` — per-file feature vectors (used by tokenizer)
-- `stats_out/vocab_config.json` — auto-bucketed vocab config
+| Flag | Default | Description |
+|---|---|---|
+| `--dirs` | required | One or more root directories, scanned recursively |
+| `--out` | stats_out | Output directory for corpus_stats.json and vocab_config.json |
+| `--workers` | cpu_count-1 | Parallel worker processes |
+| `--limit` | 0 (all) | Cap files per directory (useful for testing) |
+
+Output: `stats_out/corpus_stats.json`, `stats_out/vocab_config.json`
+
+Prints a full corpus diversity report: key distribution, tempo histogram, bucket occupancy warnings, duplicate estimate.
 
 ---
 
-## Step 2: Tokenize
+## Step 2 — Build dataset
 
-Reads features directly from `corpus_stats.json` — no re-scanning. Files not in
-corpus_stats.json are skipped entirely.
-
-- **SHA256 deduplication** — token-sequence duplicates removed after file-level dedup
-- **Outlier trimming** — sequences longer than 5x P99 deleted
-- **Structured error logging** — all failures to `tokens_out/errors.log`
+Tokenizes all MIDI files to `.npy` token arrays. Uses pre-scanned features from Step 1 (no mido re-extraction). SHA256 deduplicates token sequences. Trims extreme outliers (sequences > 5x P99 length).
 
 ```
-python build_dataset.py --stats stats_out --dirs "path/to/midi" --out tokens_out
+python build_dataset.py --stats stats_out --dirs C:\midi\bach C:\midi\maestro C:\midi\giantmidi --out tokens_out
 ```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--stats` | required | stats_out directory from Step 1 |
+| `--dirs` | required | Same directories as Step 1 |
+| `--out` | tokens_out | Output directory for *_tokens.npy files |
+| `--workers` | cpu_count-1 | Parallel worker processes |
+| `--limit` | 0 (all) | Cap files per directory |
+| `--chunk_size` | 500 | Files per IPC chunk (tune for Windows IPC overhead) |
+
+Output: `tokens_out/*.npy`, `tokens_out/manifest.json`, `tokens_out/errors.log`
 
 ---
 
-## Step 3: Validate
+## Step 3 — Validate dataset (recommended)
 
-Run before training. If anything shows RED, fix the data first.
+Check token distribution, entropy, sequence lengths, conditioning coverage, and near-duplicates before spending GPU time on a bad dataset.
 
 ```
 python validate_tokens.py --data tokens_out --stats stats_out
 ```
 
-Reports token entropy, conditioning coverage, dead tokens, near-duplicate rate, and
-duplicate sequences. Near-duplicate warnings at 60-70% are normal for stylistically
-coherent corpora and do not indicate a data problem if exact duplicates are zero.
+| Flag | Default | Description |
+|---|---|---|
+| `--data` | required | tokens_out directory from Step 2 |
+| `--stats` | required | stats_out directory from Step 1 |
+| `--top_n` | 100 | How many top tokens to show in frequency table |
+| `--max_files` | 0 (all) | Cap files to sample |
+
+Watch for: low entropy warnings, skewed conditioning dimensions, dead tokens > 30%, near-duplicate rate > 20%.
 
 ---
 
-## Step 3.5: Find Your Optimal Model Size
+## Step 4 — Train
 
-### Model sweep
+### Find the largest model that fits in your VRAM
 
-Tests model configs across a range of parameter counts at your target sequence length.
-Stops at first OOM, prints recommended config and exact training command.
-
-```
-python train.py tokens_out --stats stats_out --sweep_models --seq_len 53178 --batch_size 1 --grad_accum 16
-```
-
-### Single VRAM test
+Run the sweep before committing to a config. Tests increasing model sizes with a real forward+backward pass and reports peak VRAM.
 
 ```
-python train.py tokens_out --stats stats_out --test_vram --seq_len 53178 --d_model 160 --n_layers 6 --n_heads 4 --batch_size 1
+python train.py tokens_out --stats stats_out --seq_len 16384 --batch_size 1 --sweep_models
 ```
 
-### Example sweep results at seq_len=53178, batch=1, 16GB VRAM
+Prints a table and outputs a ready-to-paste training command at the bottom.
 
-Tested on:
-- **CPU:** Intel Core i9-12900K (16 physical / 24 logical cores)
-- **RAM:** 32GB DDR5
-- **GPU:** NVIDIA GeForce RTX 5060 Ti (16GB VRAM)
-- **Storage:** NVMe SSD
-- **Motherboard:** ASUS TUF Gaming B760-PLUS WIFI
-
-| Config | Params | VRAM | % | Headroom |
-|--------|--------|------|---|----------|
-| d=64  L=4  H=2 | 0.4M |  2396MB | 14.7% | 13915MB |
-| d=128 L=6  H=4 | 1.9M |  5976MB | 36.6% | 10335MB |
-| d=160 L=6  H=4 | 3.3M |  6982MB | 42.8% |  9328MB |
-| d=160 L=8  H=4 | 3.7M |  9086MB | 55.7% |  7224MB |
-| d=256 L=8  H=4 | 9.7M | 13291MB | 81.5% |  3020MB |
-| d=256 L=12 H=4 | 14.5M | OOM | — | — |
-
-### Choosing seq_len
-
-P99 of your corpus is a good target — 99% of songs fit as complete sequences.
-Reduce seq_len if the smallest sweep config OOMs; increase if all configs have large headroom.
-
----
-
-## Step 4: Train
-
-### Recommended configuration for 16GB VRAM at seq_len=53178
+### Test VRAM for a specific config
 
 ```
-python train.py tokens_out --stats stats_out ^
-  --seq_len 53178 --batch_size 1 --grad_accum 16 ^
-  --d_model 160 --n_layers 6 --n_heads 4
+python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_len 16384 --batch_size 1 --test_vram
 ```
 
-**Why this config:**
-- `seq_len=53178` — P99 of a typical corpus. Full musical arc visible at every training step.
-- `batch_size=1` — seq_len=53K saturates VRAM at batch=1.
-- `grad_accum=16` — simulates batch_size=16. Each optimizer step sees ~850K tokens.
-- `d_model=160 n_layers=6 n_heads=4` — 3.3M parameters. Stable, ~43% VRAM at this seq_len.
-- 1 epoch over ~160K sequences = ~10K optimizer steps, ~19-21 hours on a mid-range consumer GPU.
+### Train
 
-**Training regime: small model + enormous context**
+```
+python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_len 16384 --batch_size 1 --grad_accum 8 --epochs 10 --out run
+```
 
-With 2.5B tokens and 3.3M parameters you are massively token-rich relative to parameter
-count (Chinchilla optimal would be ~66M tokens for this model size). The model cannot
-memorize — it is forced to compress musical structure. The 53K context window means it
-sees entire pieces, not fragments.
+Auto-resumes from `run/checkpoints/latest` if it exists. Best val loss checkpoint always saved to `run/checkpoints/best`.
 
-Past the Chinchilla compute-optimal point, loss still decreases and sample quality can
-still improve — especially for generative music where long-context structure, dataset
-diversity, and tokenizer quality dominate parameter scaling. Whether this produces
-generalization or sophisticated pattern-matching is what the val loss curve reveals.
+### Resume explicitly
 
-**What to watch:**
-- Val loss first appears at step 250 (`--val_every 250`)
-- `run/checkpoints/best/` saved whenever val loss improves
-- `run/checkpoints/latest/` overwritten every 100 steps
-- `run/samples/` receives a generated MIDI every 500 steps
-- `run/loss_log.csv` tracks train loss, val loss, and LR per step
+```
+python train.py tokens_out --stats stats_out --d_model 768 --n_layers 16 --seq_len 16384 --batch_size 1 --grad_accum 8 --resume run/checkpoints/latest
+```
 
-**Expected val loss trajectory:**
-- Step 250-500: ~2.0-2.5 — model knows tokens exist, no musical logic
-- Step 1000-2000: ~1.6-1.9 — rhythmic patterns emerging, bar structure understood
-- Step 3000-5000: ~1.3-1.6 — phrase-level structure, conditioning tokens doing real work
-- Step 6000-8000: ~1.1-1.4 — diminishing returns, long-range coherence test
-- Best checkpoint likely between step 5000-8000
-
-**Resuming:** Auto-resumes from `run/checkpoints/latest/` on restart. Train/val split is
-deterministic (filename hash) — resume is safe with no data leakage.
-
-### Training flags
+### All training flags
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `--seq_len` | 53178 | Sequence length |
-| `--batch_size` | 1 | Batch size |
-| `--grad_accum` | 16 | Gradient accumulation steps |
+|---|---|---|
+| `token_dir` | required (positional) | tokens_out directory |
+| `--stats` | required | stats_out directory |
+| `--out` | run | Output directory for checkpoints, logs, samples |
+| `--resume` | None | Explicit checkpoint path to resume from |
+| **Model** | | |
 | `--d_model` | 512 | Model dimension |
-| `--n_layers` | 16 | Number of layers |
-| `--n_heads` | 8 | SSM heads |
-| `--d_state` | 64 | SSM state dimension |
-| `--epochs` | 1 | Training epochs |
-| `--lr` | 2e-4 | Peak learning rate |
-| `--grad_checkpoint` | off | Trade ~33% speed for VRAM savings |
-| `--compile` | off | torch.compile (slow first step, faster after) |
-| `--val_every` | 250 | Validation interval |
-| `--ckpt_every` | 100 | Checkpoint interval |
-| `--sample_every` | 500 | Auto-generate MIDI sample interval |
+| `--n_layers` | 12 | Number of layers |
+| `--d_state` | 32 | SSM state size per feature dim |
+| `--d_conv` | 4 | Causal conv kernel size |
+| `--expand` | 2 | d_inner = d_model * expand |
+| `--d_ff_mult` | 2.667 | SwiGLU expansion multiplier |
+| `--dropout` | 0.1 | Dropout rate |
+| `--grad_checkpoint` | off | Gradient checkpointing (saves VRAM, slows training ~20%) |
+| **Training** | | |
+| `--seq_len` | 16384 | Max sequence length |
+| `--batch_size` | 1 | Sequences per GPU step |
+| `--grad_accum` | 8 | Gradient accumulation steps (effective batch = batch_size * grad_accum) |
+| `--epochs` | 10 | Training epochs |
+| `--lr` | 3e-4 | Peak learning rate |
+| `--min_lr` | 3e-5 | Minimum LR at end of cosine schedule |
+| `--warmup_frac` | 0.02 | Fraction of total steps used for LR warmup |
+| `--weight_decay` | 0.1 | AdamW weight decay |
+| `--grad_clip` | 1.0 | Gradient norm clip |
+| `--compile` | off | Attempt torch.compile (Windows: may silently fall back to eager) |
+| **Dataset** | | |
+| `--val_frac` | 0.02 | Fraction of files held out for validation |
+| `--min_tokens` | 256 | Minimum sequence length to include |
+| `--num_workers` | 0 | DataLoader workers (keep 0 on Windows with memmap) |
+| **Checkpointing** | | |
+| `--val_every` | 500 | Validate every N optimizer steps |
+| `--val_batches` | 50 | Number of validation batches per eval |
+| `--ckpt_every` | 1000 | Save latest checkpoint every N steps |
+| `--ckpt_minutes` | 30 | Also save a timestamped checkpoint every N minutes |
+| `--sample_every` | 0 | Auto-generate a sample MIDI every N steps (0 = off) |
+| **Utility modes** | | |
+| `--sweep_models` | off | VRAM sweep across model sizes, then exit |
+| `--test_vram` | off | Single forward+backward VRAM test, then exit |
 
-### Training display
+### Recommended configs by VRAM
 
-Rich live panel on a background thread — updates every 0.25 seconds regardless of main
-thread blocking. Shows step/total, loss, val loss, LR, elapsed, ETA, tok/s, batch
-progress, best val, and status. ETA computed from rolling 50-step average.
+These are starting points. Run `--sweep_models` to confirm on your hardware.
+
+| VRAM | d_model | n_layers | ~Params | seq_len | batch | grad_accum |
+|---|---|---|---|---|---|---|
+| 8 GB | 512 | 12 | ~85M | 8192 | 1 | 8 |
+| 16 GB | 768 | 16 | ~245M | 16384 | 1 | 8 |
+| 24 GB | 768 | 20 | ~305M | 16384 | 2 | 4 |
+| 24 GB | 896 | 20 | ~415M | 16384 | 1 | 8 |
 
 ---
 
-## Step 5: Generate
+## Step 5 — Generate
+
+### Basic generation (unconditioned)
 
 ```
-python generate.py run/checkpoints/best output.mid --max_tokens 10000
+python generate.py run/checkpoints/best output.mid
 ```
 
-Conditioning examples:
+### Conditioned generation
 
 ```
-# Specific key and tempo
-python generate.py run/checkpoints/best output.mid --tempo 120 --key_root 0 --key_minor 0 --key_detected 1
-
-# No drums
-python generate.py run/checkpoints/best output.mid --has_drums 0
-
-# Slow, dense, minor
-python generate.py run/checkpoints/best output.mid --tempo 60 --key_minor 1 --polyphony 3.0
-
-# Rhythmically loose, fast, major
-python generate.py run/checkpoints/best output.mid --tempo 160 --key_minor 0 --ioi_cv 1.5
+python generate.py run/checkpoints/best output.mid --tempo 120 --key_root 0 --key_minor 0 --has_drums 1 --note_density 8
 ```
 
-Generation uses single-token recurrent stepping — O(1) memory per token, no context limit.
-EOS is ignored until `--min_tokens` (default 4000) are generated.
+### Batch generation — N variations in parallel
 
-### Generation flags
+```
+python generate.py run/checkpoints/best output.mid --batch 4
+```
+
+Writes `output_00.mid`, `output_01.mid`, `output_02.mid`, `output_03.mid`.
+
+### Long piece
+
+```
+python generate.py run/checkpoints/best output.mid --max_tokens 80000 --min_tokens 10000 --temperature 0.95
+```
+
+### All generation flags
 
 | Flag | Default | Description |
-|------|---------|-------------|
+|---|---|---|
+| `checkpoint` | required (positional) | Checkpoint directory (contains model.pt + meta.json) |
+| `output` | required (positional) | Output .mid path (stem for --batch > 1) |
+| `--batch` | 1 | Generate N variations in parallel on GPU |
 | `--max_tokens` | 50000 | Maximum tokens to generate |
-| `--min_tokens` | 4000 | Minimum before EOS is respected |
-| `--temperature` | 1.0 | Sampling temperature |
-| `--top_p` | 0.92 | Nucleus sampling cutoff |
-| `--rep_penalty` | 1.1 | Repetition penalty (1.0 = disabled) |
-| `--rep_window` | 200 | Token window for repetition penalty |
+| `--min_tokens` | 4000 | Minimum tokens before EOS is allowed |
+| `--temperature` | 0.92 | Sampling temperature (higher = more random) |
+| `--top_p` | 0.93 | Nucleus sampling cutoff |
+| `--seed` | None | Random seed for reproducibility |
+| `--rep_penalty` | 1.08 | Pitch repetition penalty (1.0 = off) |
+| `--rep_window` | 256 | Token window for repetition penalty |
+
+### Conditioning flags (all optional — omitting uses neutral mid-bucket)
+
+| Flag | Type | Description |
+|---|---|---|
+| `--tempo` | float | BPM (e.g. 120.0) |
+| `--duration_sec` | float | Target duration in seconds |
+| `--n_bars` | int | Target bar count |
+| `--pitch_min` | int | Lowest pitch (21–108) |
+| `--pitch_max` | int | Highest pitch (21–108) |
+| `--pitch_range` | int | Pitch span in semitones |
+| `--note_density` | float | Notes per bar |
+| `--avg_dur_sec` | float | Average note duration in seconds |
+| `--polyphony` | float | Average simultaneous notes |
+| `--rest_density` | float | Fraction of time silent (0–1) |
+| `--total_notes` | int | Total note count |
+| `--ioi_cv` | float | Rhythmic irregularity (0–3, higher = more irregular) |
+| `--pitch_variety` | float | Pitch variety (0–1) |
+| `--interval_diversity` | float | Average melodic interval size |
+| `--ts_num` | int | Time signature numerator (e.g. 4) |
+| `--ts_den` | int | Time signature denominator (e.g. 4) |
+| `--key_root` | int | Key root: 0=C, 1=C#, 2=D, 3=Eb, 4=E, 5=F, 6=F#, 7=G, 8=Ab, 9=A, 10=Bb, 11=B |
+| `--key_minor` | int | 0 = major, 1 = minor |
+| `--key_detected` | int | 1 = key signature present in source data |
+| `--n_tracks` | int | Number of instrument tracks |
+| `--has_drums` | int | 1 = drums present, 0 = no drums |
+| `--midi_format` | int | MIDI format: 0 or 1 |
 
 ---
 
-## Step 6: Evaluate
+## Evaluation and diagnostics
+
+### Objective quality metrics
+
+Generates N samples and computes: duplicate note %, n-gram repeat rate, unique token ratio, pitch entropy, note density, bar-to-bar similarity. Flags models with repetition or monotone output.
 
 ```
 python eval_generated.py run/checkpoints/best --stats stats_out --n 20
 ```
 
-| Metric | Bad sign |
-|--------|----------|
-| Duplicate note % | >15% |
-| 4-gram repeat rate | >0.6 |
-| Unique token ratio | <0.08 |
-| Pitch entropy | <1.5 bits |
-| Notes per bar | <0.5 |
-| Bar similarity | >0.85 |
+| Flag | Default | Description |
+|---|---|---|
+| `checkpoint` | required (positional) | Checkpoint directory |
+| `--stats` | required | stats_out directory |
+| `--n` | 20 | Number of samples to generate and evaluate |
+| `--max_tokens` | 8000 | Tokens per sample |
+| `--temperature` | 0.92 | Sampling temperature |
+| `--top_p` | 0.93 | Nucleus sampling cutoff |
+
+### Conditioning response + SSM coherence diagnostic
+
+Tests whether the model actually responds to conditioning (e.g. high tempo vs low tempo, major vs minor, drums vs no drums). Also checks for conditioning token leakage into the music section.
+
+```
+python diagnostic.py --checkpoint run/checkpoints/best --vocab stats_out/vocab_config.json
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--checkpoint` | run/checkpoints/best | Checkpoint directory |
+| `--vocab` | stats_out/vocab_config.json | vocab_config.json path |
+| `--tokens` | 600 | Tokens per test generation |
+
+### Profile training step (find bottlenecks)
+
+Runs torch.profiler for N steps at a given seq_len and prints ops sorted by CUDA time. Compare seq_len=8192 vs seq_len=32768 to find what grows superlinearly.
+
+```
+python profile_step.py --seq_len 16384 --d_model 768 --n_layers 16 --stats stats_out
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--seq_len` | 53178 | Sequence length to profile |
+| `--d_model` | 512 | Model dimension |
+| `--n_layers` | 16 | Number of layers |
+| `--grad_checkpoint` | on | Use gradient checkpointing |
+| `--no_checkpoint` | — | Disable gradient checkpointing |
+| `--steps` | 6 | Number of steps to profile |
+| `--stats` | stats_out | stats_out directory (for vocab size) |
 
 ---
 
-## Conditioning Dimensions
+## Testing
 
-281 total conditioning tokens. All optional — omitted dimensions use neutral mid-bucket.
+### SSM scan correctness
 
-| Flag | Description |
-|------|-------------|
-| `--tempo` | BPM |
-| `--duration_sec` | Target duration in seconds |
-| `--n_bars` | Target bar count |
-| `--pitch_min` | Lowest pitch (MIDI 0-127) |
-| `--pitch_max` | Highest pitch (MIDI 0-127) |
-| `--pitch_range` | Pitch span in semitones |
-| `--note_density` | Average notes per bar |
-| `--avg_dur_sec` | Average note duration in seconds |
-| `--polyphony` | Average simultaneous notes |
-| `--rest_density` | Fraction of time silent (0-1) |
-| `--ioi_cv` | Rhythmic irregularity (0=metronomic, 2+=chaotic) |
-| `--pitch_variety` | Unique pitches / 128 MIDI range (0-1) |
-| `--interval_diversity` | Average melodic interval in semitones |
-| `--ts_num` | Time signature numerator |
-| `--ts_den` | Time signature denominator |
-| `--key_root` | Key root: 0=C 1=C# 2=D ... 11=B |
-| `--key_minor` | 0=major 1=minor |
-| `--key_detected` | 1=real key signature present, 0=unknown |
-| `--n_tracks` | Number of instrument tracks |
-| `--has_drums` | 1=drums on channel 9, 0=no drums |
+Verifies `_ssm_scan` against a sequential reference loop at multiple sequence lengths. Run this after any changes to model.py.
+
+```
+python test_scan.py
+```
+
+All cases should print `[PASS]`. If any print `[FAIL]` the scan math is broken.
+
+### SSM scan benchmark
+
+Correctness + gradient check + wall-clock throughput. Useful for confirming performance on new hardware.
+
+```
+python bench_scan.py
+```
 
 ---
 
-## Output Structure
+## Output structure
+
+After training:
 
 ```
 run/
-├── checkpoints/
-│   ├── latest/           — overwritten every 100 steps
-│   ├── best/             — lowest val loss seen during training
-│   └── step_XXXXXXX/     — permanent timed checkpoints (every 30 min)
-├── samples/
-│   └── step_XXXXXXX.mid  — auto-generated every 500 steps
-└── loss_log.csv          — step, train_loss, val_loss, lr
+  checkpoints/
+    best/           — best validation loss checkpoint
+      model.pt
+      optimizer.pt
+      meta.json
+    latest/         — most recent checkpoint (auto-resume target)
+    step_0001000/   — timed permanent checkpoints
+    step_0002000/
+  samples/          — auto-generated MIDI samples (if --sample_every > 0)
+    step_0001000.mid
+  loss_log.csv      — step, train_loss, val_loss, lr
+```
 
-tokens_out/
-├── *_tokens.npy          — tokenized song files
-├── manifest.json         — file index
-├── errors.log            — tokenization errors
-├── .split_cache.pkl      — filename→split+length cache (permanent)
-├── .chunk_cache_train.pkl — chunk list cache (rebuilds on seq_len change)
-└── .chunk_cache_val.pkl
+`meta.json` contains everything needed to reload the model:
 
-stats_out/
-├── corpus_stats.json     — per-file feature vectors (used by tokenizer)
-└── vocab_config.json     — conditioning token config
+```json
+{
+  "step": 12500,
+  "epoch": 3,
+  "best_val": 1.8432,
+  "vocab_config": "stats_out/vocab_config.json",
+  "model_cfg": {
+    "vocab_size": 442,
+    "d_model": 768,
+    "n_layers": 16,
+    ...
+  }
+}
 ```
 
 ---
 
-## Architecture
+## Architecture notes
 
-### Token layout
+**Model:** Mamba1 SSM. `A_log`, `dt_bias`, `D` are `(d_inner,)` — one parameter per feature dimension. State per layer per batch element is `(d_inner, d_state)`. No multi-head grouping.
 
-```
-[0 .. COND_END)       conditioning tokens (auto-sized from corpus)
-COND_END + 0          PAD
-COND_END + 1          BOS
-COND_END + 2          EOS
-COND_END + 3          BAR
-COND_END + 4..19      POS_0..POS_15 (16th note positions within bar)
-COND_END + 20..28     TRACK_0..TRACK_8
-COND_END + 29..116    PITCH_21..PITCH_108 (88 piano keys)
-COND_END + 117..132   DUR_1..DUR_16
-COND_END + 133..140   VEL_1..VEL_8
-COND_END + 141..157   TEMPO_40..TEMPO_200 (step 10)
-COND_END + 158..160   SECTION_EARLY / SECTION_MID / SECTION_LATE
-```
+**SSM scan:** Hillis-Steele parallel prefix scan, chunked across sequence for memory efficiency. CHUNK=2048 means ~8 sequential carry iterations at seq_len=16384. fp32 accumulation, cast back to input dtype on return.
 
-Each note encodes as: `TRACK + POS + PITCH + DUR + VEL` (5 tokens minimum).
+**Tokenizer:** BAR / SECTION / TEMPO / POS / TRACK / PITCH / DUR / VEL token schema. Conditioning prefix prepended to every sequence — data-driven bucket boundaries computed from corpus statistics, not hardcoded. Token layout is identical to midigen2; existing tokenized datasets are compatible.
 
-### SSM formulation (per head)
+**Training:** bfloat16 autocast (native on sm_86+, including RTX 5060 Ti sm_100). Fused AdamW. Cosine LR with warmup. Per-batch dynamic padding via `PadCollator` — sequences padded to longest in batch, not to global max_seq. Memmap dataset — no full corpus preload.
 
-```
-h[t] = dA[t] * h[t-1] + dB[t] * x_ssm[t]   state update
-y[t] = C[t] @ h[t]                            output
-```
-
-- `dA` — scalar decay per head, values in (0,1)
-- `dB`, `C` — d_state vectors per head
-- `x_ssm` — scalar input per head
-- State size fixed at `(n_heads, d_state)` — does not grow with sequence length
-
-### Scan implementation
-
-Segmented cumsum scan — ~1662 Python iterations for T=53K (SEG=32). Within each
-segment of 32 tokens, cumprod stays numerically safe in float32 (worst case
-cumA = dA_min^32 ≈ 2e-42, well above float32 underflow). Segments are chained
-via carry state. Verified correct against sequential reference at all sequence
-lengths with max error < 5e-7. Runs in float32 internally regardless of autocast.
-
-Within each segment:
-```
-logcumA  = cumsum(log(dA))               # accumulated decay in log space
-cumA     = exp(logcumA)                  # safe at SEG=32
-inv_cumA = exp(-logcumA).clamp(max=85)  # normalize inputs, clamped for safety
-Bu_norm  = dBx * inv_cumA               # scale inputs by inverse cumulative decay
-bu       = cumA * cumsum(Bu_norm)        # reconstruct hidden states
-carry    = cumA * h_prev                 # propagate carry from previous segment
-h_seg    = bu + carry                    # final hidden states for this segment
-```
-
-The `test_scan.py` script verifies correctness against a sequential reference
-implementation at T=16, 128, 1024, 2048, 8192, 16384, and 53178.
-
-### Inference
-
-Single-token recurrent step updates the SSM state in O(1) memory and time:
-```
-h_new = dA * h_prev + dB * x_ssm
-y     = C @ h_new
-```
-
-No context window limit — generate indefinitely without forgetting earlier context.
+**Inference:** Recurrent step mode — O(1) memory and compute per token regardless of sequence length. No context window limit.
