@@ -97,7 +97,6 @@ def save_checkpoint(path: Path, model, optimizer, step: int, epoch: int,
             "vocab_size": cfg.vocab_size,
             "d_model":    cfg.d_model,
             "n_layers":   cfg.n_layers,
-            "d_state":    cfg.d_state,
             "d_conv":     cfg.d_conv,
             "expand":     cfg.expand,
             "d_ff_mult":  cfg.d_ff_mult,
@@ -190,7 +189,6 @@ def main():
     # Model
     parser.add_argument("--d_model",             type=int,   default=512)
     parser.add_argument("--n_layers",            type=int,   default=12)
-    parser.add_argument("--d_state",             type=int,   default=32)
     parser.add_argument("--d_conv",              type=int,   default=4)
     parser.add_argument("--expand",              type=int,   default=2)
     parser.add_argument("--d_ff_mult",           type=float, default=2.667)
@@ -261,7 +259,6 @@ def main():
         vocab_size  = tok.VOCAB_SIZE,
         d_model     = args.d_model,
         n_layers    = args.n_layers,
-        d_state     = args.d_state,
         d_conv      = args.d_conv,
         expand      = args.expand,
         d_ff_mult   = args.d_ff_mult,
@@ -441,7 +438,7 @@ def main():
         for d_model, n_layers, label in sweep_configs:
             sweep_cfg = ModelConfig(
                 vocab_size=tok.VOCAB_SIZE, d_model=d_model, n_layers=n_layers,
-                d_state=args.d_state, d_conv=args.d_conv, expand=args.expand,
+                d_conv=args.d_conv, expand=args.expand,
                 max_seq=args.seq_len, grad_ckpt=args.grad_checkpoint,
             )
             try:
