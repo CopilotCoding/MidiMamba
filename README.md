@@ -147,7 +147,7 @@ python train.py tokens_out --stats stats_out ^
 ### Train
 
 ```
-python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --grad_accum 8 --d_model 128 --n_layers 8 --epochs 1 --out run
+python train.py tokens_out --stats stats_out --seq_len 8192 --batch_size 1 --grad_accum 8 --d_model 128 --n_layers 8 --epochs 1 --out run --sample_every 500
 ```
 
 Auto-resumes from `run/checkpoints/latest` if it exists. Best val loss checkpoint always saved to `run/checkpoints/best`.
