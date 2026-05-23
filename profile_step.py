@@ -43,7 +43,7 @@ def main():
     device = "cuda"
     cfg = ModelConfig(
         vocab_size=vocab, d_model=args.d_model, n_layers=args.n_layers,
-        d_state=64, max_seq=args.seq_len,
+        max_seq=args.seq_len,
         grad_ckpt=args.grad_checkpoint,
     )
     model = MidiMamba(cfg).to(device).train()
