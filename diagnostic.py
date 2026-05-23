@@ -171,7 +171,7 @@ def main():
     model, meta, cfg = load_model(args.checkpoint)
     print(f"  Step: {meta['step']}")
     print(f"  Best val: {meta['best_val']:.4f}")
-    print(f"  Config: d={cfg.d_model} L={cfg.n_layers} S={cfg.d_state}")
+    print(f"  Config: d={cfg.d_model} L={cfg.n_layers} ")
     print(f"  Params: {model.param_count_str()}")
 
     test_conditioning_response(model, vocab_config, n_tokens=args.tokens)
