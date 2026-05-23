@@ -353,7 +353,7 @@ run/
 
 ## Architecture
 
-**SSM:** SM1 (Scalar Mamba 1) — a Mamba1 variant with d_state=1. The state per feature is a single scalar, enabling an exact closed-form scan via cumprod + cumsum: two vectorized GPU ops, no Python loop, no OOM risk, numerically stable. SM1 is the one of the only Mamba formulations that admits this closed-form without custom CUDA kernels, making it viable on Blackwell (sm_120) where mamba-ssm is unsupported.
+**SSM:** SM1 (Scalar Mamba 1) — a Mamba1 variant with d_state=1. The state per feature is a single scalar, enabling an exact closed-form scan via cumprod + cumsum: two vectorized GPU ops, no Python loop, no OOM risk, numerically stable. SM1 is one of the only Mamba formulations that admits this closed-form without custom CUDA kernels, making it viable on Blackwell (sm_120) where mamba-ssm is unsupported.
 
 **Scan:**
 ```
