@@ -2,6 +2,8 @@
 
 **PROJECT IS A FAILURE TO LEARN FROM:** MIDI generation using SM1 (Scalar Mamba 1), a novel SSM variant implemented from scratch in pure PyTorch with no custom CUDA kernels. Trains on RTX 50-series (Blackwell sm_120) where the official mamba-ssm library doesn't run. Trained on 163K MIDI files, 2.5B tokens.
 
+**Final outcome:** generated music consistently sounded low quality and structurally weak. Multiple architectural tweaks, training adjustments, and sampling changes did not resolve the degradation. The system failed to produce convincing musical output.
+
 Pure PyTorch, Windows-compatible, bfloat16-native. No mamba-ssm, no causal-conv1d, no Triton dependency.
 
 ---
@@ -55,12 +57,12 @@ Remove exact duplicate MIDI files from your corpus before scanning. Keeps the ol
 python midideduper.py --path C:\midi\corpus
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--path` | required | Root directory to scan recursively |
-| `--workers` | 12 | Parallel hash workers |
-| `--dry-run` | off | Report duplicates without deleting |
-| `--log` | dedupe_log.txt | Log file path |
+| Flag        | Default        | Description                        |
+| ----------- | -------------- | ---------------------------------- |
+| `--path`    | required       | Root directory to scan recursively |
+| `--workers` | 12             | Parallel hash workers              |
+| `--dry-run` | off            | Report duplicates without deleting |
+| `--log`     | dedupe_log.txt | Log file path                      |
 
 ---
 
@@ -72,12 +74,12 @@ Extracts features from every MIDI file, computes data-driven bucket boundaries, 
 python scan_dataset.py --dirs C:\midi\corpus --out stats_out
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--dirs` | required | One or more root directories, scanned recursively |
-| `--out` | stats_out | Output directory for corpus_stats.json and vocab_config.json |
-| `--workers` | cpu_count-1 | Parallel worker processes |
-| `--limit` | 0 (all) | Cap files per directory (useful for testing) |
+| Flag        | Default     | Description                                                  |
+| ----------- | ----------- | ------------------------------------------------------------ |
+| `--dirs`    | required    | One or more root directories, scanned recursively            |
+| `--out`     | stats_out   | Output directory for corpus_stats.json and vocab_config.json |
+| `--workers` | cpu_count-1 | Parallel worker processes                                    |
+| `--limit`   | 0 (all)     | Cap files per directory (useful for testing)                 |
 
 Output: `stats_out/corpus_stats.json`, `stats_out/vocab_config.json`
 
@@ -91,14 +93,14 @@ Tokenizes all MIDI files to `.npy` token arrays. Uses pre-scanned features from 
 python build_dataset.py --stats stats_out --dirs C:\midi\corpus --out tokens_out
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--stats` | required | stats_out directory from Step 1 |
-| `--dirs` | required | Same directories as Step 1 |
-| `--out` | tokens_out | Output directory for *_tokens.npy files |
-| `--workers` | cpu_count-1 | Parallel worker processes |
-| `--limit` | 0 (all) | Cap files per directory |
-| `--chunk_size` | 500 | Files per IPC chunk |
+| Flag           | Default     | Description                             |
+| -------------- | ----------- | --------------------------------------- |
+| `--stats`      | required    | stats_out directory from Step 1         |
+| `--dirs`       | required    | Same directories as Step 1              |
+| `--out`        | tokens_out  | Output directory for *_tokens.npy files |
+| `--workers`    | cpu_count-1 | Parallel worker processes               |
+| `--limit`      | 0 (all)     | Cap files per directory                 |
+| `--chunk_size` | 500         | Files per IPC chunk                     |
 
 Output: `tokens_out/*.npy`, `tokens_out/manifest.json`, `tokens_out/errors.log`
 
@@ -112,14 +114,15 @@ Check token distribution, entropy, sequence lengths, and near-duplicates before 
 python validate_tokens.py --data tokens_out --stats stats_out
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--data` | required | tokens_out directory from Step 2 |
-| `--stats` | required | stats_out directory from Step 1 |
-| `--top_n` | 100 | Top N tokens to show in frequency table |
-| `--max_files` | 0 (all) | Cap files to sample |
+| Flag          | Default  | Description                             |
+| ------------- | -------- | --------------------------------------- |
+| `--data`      | required | tokens_out directory from Step 2        |
+| `--stats`     | required | stats_out directory from Step 1         |
+| `--top_n`     | 100      | Top N tokens to show in frequency table |
+| `--max_files` | 0 (all)  | Cap files to sample                     |
 
 Example output on a healthy corpus:
+
 ```
 Sequence stats — Files: 163,068 | Min: 131 | Avg: 15,499 | P50: 13,573 | P90: 31,029 | P99: 53,173 | Max: 150,889
 Token stats    — Total: 2,527,427,619 | Unique: 441 | Entropy: 5.68 bits | Duplicates: 0
@@ -165,44 +168,44 @@ python train.py tokens_out --stats stats_out ^
 
 ### All training flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `token_dir` | required (positional) | tokens_out directory |
-| `--stats` | required | stats_out directory |
-| `--out` | run | Output directory for checkpoints, logs, samples |
-| `--resume` | None | Explicit checkpoint path to resume from |
-| **Model** | | |
-| `--d_model` | 512 | Model dimension |
-| `--n_layers` | 12 | Number of layers |
-| `--d_conv` | 4 | Causal conv kernel size |
-| `--expand` | 2 | d_inner = d_model * expand |
-| `--d_ff_mult` | 2.667 | SwiGLU expansion multiplier |
-| `--dropout` | 0.1 | Dropout rate |
-| `--grad_checkpoint` | off | Gradient checkpointing (saves VRAM, ~20% slower) |
-| **Training** | | |
-| `--seq_len` | 16384 | Max sequence length |
-| `--batch_size` | 1 | Sequences per GPU step |
-| `--grad_accum` | 8 | Gradient accumulation steps |
-| `--epochs` | 10 | Training epochs (1 epoch = full corpus pass; on 2.5B tokens, 1–2 is typical) |
-| `--lr` | 3e-4 | Peak learning rate |
-| `--min_lr` | 3e-5 | Minimum LR at end of cosine schedule |
-| `--warmup_frac` | 0.02 | Fraction of total steps for LR warmup |
-| `--weight_decay` | 0.1 | AdamW weight decay |
-| `--grad_clip` | 1.0 | Gradient norm clip |
-| `--compile` | off | Attempt torch.compile (may hang on Windows) |
-| **Dataset** | | |
-| `--val_frac` | 0.02 | Fraction of files held out for validation |
-| `--min_tokens` | 256 | Minimum sequence length to include |
-| `--num_workers` | 0 | DataLoader workers (keep 0 on Windows with memmap) |
-| **Checkpointing** | | |
-| `--val_every` | 500 | Validate every N optimizer steps |
-| `--val_batches` | 50 | Validation batches per eval |
-| `--ckpt_every` | 1000 | Save latest checkpoint every N steps |
-| `--ckpt_minutes` | 30 | Also save a timestamped checkpoint every N minutes |
-| `--sample_every` | 0 | Auto-generate a sample MIDI every N steps (0 = off) |
-| **Utility modes** | | |
-| `--sweep_models` | off | VRAM sweep across model sizes, then exit |
-| `--test_vram` | off | Single forward+backward VRAM test, then exit |
+| Flag                | Default               | Description                                                                  |
+| ------------------- | --------------------- | ---------------------------------------------------------------------------- |
+| `token_dir`         | required (positional) | tokens_out directory                                                         |
+| `--stats`           | required              | stats_out directory                                                          |
+| `--out`             | run                   | Output directory for checkpoints, logs, samples                              |
+| `--resume`          | None                  | Explicit checkpoint path to resume from                                      |
+| **Model**           |                       |                                                                              |
+| `--d_model`         | 512                   | Model dimension                                                              |
+| `--n_layers`        | 12                    | Number of layers                                                             |
+| `--d_conv`          | 4                     | Causal conv kernel size                                                      |
+| `--expand`          | 2                     | d_inner = d_model * expand                                                   |
+| `--d_ff_mult`       | 2.667                 | SwiGLU expansion multiplier                                                  |
+| `--dropout`         | 0.1                   | Dropout rate                                                                 |
+| `--grad_checkpoint` | off                   | Gradient checkpointing (saves VRAM, ~20% slower)                             |
+| **Training**        |                       |                                                                              |
+| `--seq_len`         | 16384                 | Max sequence length                                                          |
+| `--batch_size`      | 1                     | Sequences per GPU step                                                       |
+| `--grad_accum`      | 8                     | Gradient accumulation steps                                                  |
+| `--epochs`          | 10                    | Training epochs (1 epoch = full corpus pass; on 2.5B tokens, 1–2 is typical) |
+| `--lr`              | 3e-4                  | Peak learning rate                                                           |
+| `--min_lr`          | 3e-5                  | Minimum LR at end of cosine schedule                                         |
+| `--warmup_frac`     | 0.02                  | Fraction of total steps for LR warmup                                        |
+| `--weight_decay`    | 0.1                   | AdamW weight decay                                                           |
+| `--grad_clip`       | 1.0                   | Gradient norm clip                                                           |
+| `--compile`         | off                   | Attempt torch.compile (may hang on Windows)                                  |
+| **Dataset**         |                       |                                                                              |
+| `--val_frac`        | 0.02                  | Fraction of files held out for validation                                    |
+| `--min_tokens`      | 256                   | Minimum sequence length to include                                           |
+| `--num_workers`     | 0                     | DataLoader workers (keep 0 on Windows with memmap)                           |
+| **Checkpointing**   |                       |                                                                              |
+| `--val_every`       | 500                   | Validate every N optimizer steps                                             |
+| `--val_batches`     | 50                    | Validation batches per eval                                                  |
+| `--ckpt_every`      | 1000                  | Save latest checkpoint every N steps                                         |
+| `--ckpt_minutes`    | 30                    | Also save a timestamped checkpoint every N minutes                           |
+| `--sample_every`    | 0                     | Auto-generate a sample MIDI every N steps (0 = off)                          |
+| **Utility modes**   |                       |                                                                              |
+| `--sweep_models`    | off                   | VRAM sweep across model sizes, then exit                                     |
+| `--test_vram`       | off                   | Single forward+backward VRAM test, then exit                                 |
 
 ---
 
@@ -231,45 +234,45 @@ Writes `output_00.mid`, `output_01.mid`, etc.
 
 ### All generation flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `checkpoint` | required (positional) | Checkpoint directory |
-| `output` | required (positional) | Output .mid path (stem for --batch > 1) |
-| `--batch` | 1 | Generate N variations in parallel |
-| `--max_tokens` | 50000 | Maximum tokens to generate |
-| `--min_tokens` | 4000 | Minimum tokens before EOS is allowed |
-| `--temperature` | 0.92 | Sampling temperature |
-| `--top_p` | 0.93 | Nucleus sampling cutoff |
-| `--seed` | None | Random seed for reproducibility |
-| `--rep_penalty` | 1.08 | Pitch repetition penalty (1.0 = off) |
-| `--rep_window` | 256 | Token window for repetition penalty |
+| Flag            | Default               | Description                             |
+| --------------- | --------------------- | --------------------------------------- |
+| `checkpoint`    | required (positional) | Checkpoint directory                    |
+| `output`        | required (positional) | Output .mid path (stem for --batch > 1) |
+| `--batch`       | 1                     | Generate N variations in parallel       |
+| `--max_tokens`  | 50000                 | Maximum tokens to generate              |
+| `--min_tokens`  | 4000                  | Minimum tokens before EOS is allowed    |
+| `--temperature` | 0.92                  | Sampling temperature                    |
+| `--top_p`       | 0.93                  | Nucleus sampling cutoff                 |
+| `--seed`        | None                  | Random seed for reproducibility         |
+| `--rep_penalty` | 1.08                  | Pitch repetition penalty (1.0 = off)    |
+| `--rep_window`  | 256                   | Token window for repetition penalty     |
 
 ### Conditioning flags (all optional)
 
-| Flag | Type | Description |
-|---|---|---|
-| `--tempo` | float | BPM |
-| `--duration_sec` | float | Target duration in seconds |
-| `--n_bars` | int | Target bar count |
-| `--pitch_min` | int | Lowest pitch (21–108) |
-| `--pitch_max` | int | Highest pitch (21–108) |
-| `--pitch_range` | int | Pitch span in semitones |
-| `--note_density` | float | Notes per bar |
-| `--avg_dur_sec` | float | Average note duration in seconds |
-| `--polyphony` | float | Average simultaneous notes |
-| `--rest_density` | float | Fraction of time silent (0–1) |
-| `--total_notes` | int | Total note count |
-| `--ioi_cv` | float | Rhythmic irregularity (0–3) |
-| `--pitch_variety` | float | Pitch variety (0–1) |
-| `--interval_diversity` | float | Average melodic interval size |
-| `--ts_num` | int | Time signature numerator |
-| `--ts_den` | int | Time signature denominator |
-| `--key_root` | int | 0=C, 1=C#, 2=D, 3=Eb, 4=E, 5=F, 6=F#, 7=G, 8=Ab, 9=A, 10=Bb, 11=B |
-| `--key_minor` | int | 0 = major, 1 = minor |
-| `--key_detected` | int | 1 = key signature present |
-| `--n_tracks` | int | Number of instrument tracks |
-| `--has_drums` | int | 1 = drums, 0 = no drums |
-| `--midi_format` | int | MIDI format: 0 or 1 |
+| Flag                   | Type  | Description                                                       |
+| ---------------------- | ----- | ----------------------------------------------------------------- |
+| `--tempo`              | float | BPM                                                               |
+| `--duration_sec`       | float | Target duration in seconds                                        |
+| `--n_bars`             | int   | Target bar count                                                  |
+| `--pitch_min`          | int   | Lowest pitch (21–108)                                             |
+| `--pitch_max`          | int   | Highest pitch (21–108)                                            |
+| `--pitch_range`        | int   | Pitch span in semitones                                           |
+| `--note_density`       | float | Notes per bar                                                     |
+| `--avg_dur_sec`        | float | Average note duration in seconds                                  |
+| `--polyphony`          | float | Average simultaneous notes                                        |
+| `--rest_density`       | float | Fraction of time silent (0–1)                                     |
+| `--total_notes`        | int   | Total note count                                                  |
+| `--ioi_cv`             | float | Rhythmic irregularity (0–3)                                       |
+| `--pitch_variety`      | float | Pitch variety (0–1)                                               |
+| `--interval_diversity` | float | Average melodic interval size                                     |
+| `--ts_num`             | int   | Time signature numerator                                          |
+| `--ts_den`             | int   | Time signature denominator                                        |
+| `--key_root`           | int   | 0=C, 1=C#, 2=D, 3=Eb, 4=E, 5=F, 6=F#, 7=G, 8=Ab, 9=A, 10=Bb, 11=B |
+| `--key_minor`          | int   | 0 = major, 1 = minor                                              |
+| `--key_detected`       | int   | 1 = key signature present                                         |
+| `--n_tracks`           | int   | Number of instrument tracks                                       |
+| `--has_drums`          | int   | 1 = drums, 0 = no drums                                           |
+| `--midi_format`        | int   | MIDI format: 0 or 1                                               |
 
 ---
 
@@ -283,14 +286,14 @@ python eval_generated.py run/checkpoints/best --stats stats_out --n 20
 
 Generates N samples and computes duplicate note %, n-gram repeat rate, unique token ratio, pitch entropy, note density, bar similarity.
 
-| Flag | Default | Description |
-|---|---|---|
-| `checkpoint` | required | Checkpoint directory |
-| `--stats` | required | stats_out directory |
-| `--n` | 20 | Number of samples to evaluate |
-| `--max_tokens` | 8000 | Tokens per sample |
-| `--temperature` | 0.92 | Sampling temperature |
-| `--top_p` | 0.93 | Nucleus sampling cutoff |
+| Flag            | Default  | Description                   |
+| --------------- | -------- | ----------------------------- |
+| `checkpoint`    | required | Checkpoint directory          |
+| `--stats`       | required | stats_out directory           |
+| `--n`           | 20       | Number of samples to evaluate |
+| `--max_tokens`  | 8000     | Tokens per sample             |
+| `--temperature` | 0.92     | Sampling temperature          |
+| `--top_p`       | 0.93     | Nucleus sampling cutoff       |
 
 ### Conditioning response diagnostic
 
@@ -300,11 +303,11 @@ python diagnostic.py --checkpoint run/checkpoints/best --vocab stats_out/vocab_c
 
 Tests whether the model responds to conditioning (tempo, key, drums). Also checks for conditioning token leakage.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--checkpoint` | run/checkpoints/best | Checkpoint directory |
-| `--vocab` | stats_out/vocab_config.json | vocab_config.json path |
-| `--tokens` | 600 | Tokens per test generation |
+| Flag           | Default                     | Description                |
+| -------------- | --------------------------- | -------------------------- |
+| `--checkpoint` | run/checkpoints/best        | Checkpoint directory       |
+| `--vocab`      | stats_out/vocab_config.json | vocab_config.json path     |
+| `--tokens`     | 600                         | Tokens per test generation |
 
 ### Profile training step
 
@@ -314,14 +317,14 @@ python profile_step.py --seq_len 4096 --d_model 704 --n_layers 10 --stats stats_
 
 Runs torch.profiler and prints ops sorted by CUDA time.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--seq_len` | 53178 | Sequence length to profile |
-| `--d_model` | 512 | Model dimension |
-| `--n_layers` | 16 | Number of layers |
-| `--grad_checkpoint` | on | Use gradient checkpointing |
-| `--steps` | 6 | Steps to profile |
-| `--stats` | stats_out | stats_out directory |
+| Flag                | Default   | Description                |
+| ------------------- | --------- | -------------------------- |
+| `--seq_len`         | 53178     | Sequence length to profile |
+| `--d_model`         | 512       | Model dimension            |
+| `--n_layers`        | 16        | Number of layers           |
+| `--grad_checkpoint` | on        | Use gradient checkpointing |
+| `--steps`           | 6         | Steps to profile           |
+| `--stats`           | stats_out | stats_out directory        |
 
 ---
 
@@ -346,7 +349,7 @@ run/
     latest/           — most recent checkpoint (auto-resume target)
     step_0001000/     — timed permanent checkpoints
   samples/            — auto-generated MIDI (if --sample_every > 0)
-  loss_log.csv        — step, train_loss, val_loss, lr
+  loss_log.csv       — step, train_loss, val_loss, lr
 ```
 
 ---
@@ -356,6 +359,7 @@ run/
 **SSM:** SM1 (Scalar Mamba 1) — a Mamba1 variant with d_state=1. The state per feature is a single scalar, enabling an exact closed-form scan via cumprod + cumsum: two vectorized GPU ops, no Python loop, no OOM risk, numerically stable. SM1 is one of the only Mamba formulations that admits this closed-form without custom CUDA kernels, making it viable on Blackwell (sm_120) where mamba-ssm is unsupported.
 
 **Scan:**
+
 ```
 L[t]     = cumprod(dA, dim=1)           cumulative decay
 h[t]     = L[t] * cumsum(dBx/L, dim=1) hidden states  
