@@ -1,6 +1,6 @@
 # MidiGen3
 
-**WIP:** MIDI generation using SM1 (Scalar Mamba 1), a novel SSM variant implemented from scratch in pure PyTorch with no custom CUDA kernels. Trains on RTX 50-series (Blackwell sm_120) where the official mamba-ssm library doesn't run. Trained on 163K MIDI files, 2.5B tokens.
+**PROJECT IS A FAILURE TO LEARN FROM:** MIDI generation using SM1 (Scalar Mamba 1), a novel SSM variant implemented from scratch in pure PyTorch with no custom CUDA kernels. Trains on RTX 50-series (Blackwell sm_120) where the official mamba-ssm library doesn't run. Trained on 163K MIDI files, 2.5B tokens.
 
 Pure PyTorch, Windows-compatible, bfloat16-native. No mamba-ssm, no causal-conv1d, no Triton dependency.
 
